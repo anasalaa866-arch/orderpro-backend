@@ -580,6 +580,90 @@ async function fetchShopifyOrders(shopUrl, accessToken, sinceDate) {
   return allOrders;
 }
 
+// ===== SHOPIFY ASSIGN: Fulfill + Tag =====
+app.post('/api/shopify/assign', async (req, res) => {
+  const { shopUrl, accessToken, shopifyOrderId, courierName, orderId } = req.body;
+  if (!shopUrl || !accessToken || !shopifyOrderId) {
+    return res.status(400).json({ success: false, error: 'بيانات ناقصة' });
+  }
+
+  const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  const errors = [];
+
+  // 1. إضافة Tag باسم المندوب
+  try {
+    // جيب الـ tags الحالية
+    const getR = await shopifyRequest(host, accessToken, `/admin/api/2024-01/orders/${shopifyOrderId}.json?fields=id,tags`);
+    if (getR.status === 200 && getR.data.order) {
+      const currentTags = getR.data.order.tags || '';
+      const newTags = currentTags
+        ? currentTags.split(',').map(t=>t.trim()).filter(t=>t).concat(courierName).join(', ')
+        : courierName;
+      
+      await shopifyRequest(host, accessToken, `/admin/api/2024-01/orders/${shopifyOrderId}.json`, 'PUT',
+        { order: { id: shopifyOrderId, tags: newTags } });
+    }
+  } catch (e) { errors.push('Tag: ' + e.message); }
+
+  // 2. Fulfill الطلب
+  try {
+    // جيب الـ fulfillment orders
+    const foR = await shopifyRequest(host, accessToken,
+      `/admin/api/2024-01/orders/${shopifyOrderId}/fulfillment_orders.json`);
+    
+    if (foR.status === 200 && foR.data.fulfillment_orders) {
+      const pendingFOs = foR.data.fulfillment_orders.filter(fo =>
+        fo.status === 'open' || fo.status === 'in_progress'
+      );
+      
+      for (const fo of pendingFOs) {
+        const lineItems = fo.line_items.map(li => ({
+          fulfillment_order_id: fo.id,
+          fulfillment_order_line_item_id: li.id,
+          quantity: li.fulfillable_quantity,
+        }));
+        
+        if (lineItems.some(li => li.quantity > 0)) {
+          await shopifyRequest(host, accessToken,
+            `/admin/api/2024-01/fulfillments.json`, 'POST', {
+              fulfillment: {
+                line_items_by_fulfillment_order: [
+                  { fulfillment_order_id: fo.id, fulfillment_order_line_items: lineItems }
+                ],
+                notify_customer: false,
+                tracking_info: { company: courierName },
+              }
+            });
+        }
+      }
+    }
+  } catch (e) { errors.push('Fulfill: ' + e.message); }
+
+  res.json({ success: errors.length === 0, errors, message: errors.length ? errors.join(' | ') : 'تم بنجاح' });
+});
+
+function shopifyRequest(host, accessToken, path, method = 'GET', body = null) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname: host, path, method,
+      headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' },
+      timeout: 15000,
+    };
+    const req = require('https').request(opts, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(data || '{}') }); }
+        catch { resolve({ status: res.statusCode, data: {} }); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
 // ===== HEALTH =====
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0;
