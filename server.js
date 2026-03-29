@@ -176,4 +176,95 @@ app.post('/api/orders', (req, res) => { const order = { id: 'MN-'+(1000+nextId++
 app.patch('/api/orders/:id', (req, res) => { const o = orders.find(o => o.id===req.params.id); if (!o) return res.status(404).json({ error:'not found' }); Object.assign(o, req.body); res.json({ order: o }); });
 app.delete('/api/orders/:id', (req, res) => { orders = orders.filter(o => o.id!==req.params.id); res.json({ ok:true }); });
 app.get('/', (req, res) => res.json({ status:'✅ OrderPro Backend شغال', orders:orders.length, uptime:Math.floor(process.uptime())+' ثانية' }));
+
+// ===== BOSTA PROXY =====
+const BOSTA_URL = (env) => env==='staging'
+  ? 'https://staging.bostaapp.com/api/v0'
+  : 'https://app.bosta.co/api/v0';
+
+function bostaRequest(env, apiKey, path, method='GET', body=null){
+  return new Promise((resolve, reject)=>{
+    const base = BOSTA_URL(env);
+    const url = new URL(base + path);
+    const opts = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method,
+      headers: {
+        'Authorization': apiKey,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      }
+    };
+    const protocol = url.protocol === 'https:' ? require('https') : require('http');
+    const req = protocol.request(opts, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, data: JSON.parse(data||'{}'), headers: res.headers }); }
+        catch(e) { resolve({ status: res.statusCode, data: {raw: data}, headers: res.headers }); }
+      });
+    });
+    req.on('error', reject);
+    if(body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+// Test Bosta connection
+app.post('/api/bosta/test', async (req, res) => {
+  const { apiKey, env='production' } = req.body;
+  if(!apiKey) return res.status(400).json({ success:false, error:'API Key مطلوب' });
+  try {
+    const r = await bostaRequest(env, apiKey, '/pickup-locations');
+    if(r.status===200){
+      const locs = r.data.data||r.data||[];
+      res.json({ success:true, message:'متصل بنجاح', locations: Array.isArray(locs)?locs.length:1 });
+    } else if(r.status===401){
+      res.json({ success:false, error:'الـ API Key غلط أو منتهي — تأكد من الـ Key من داشبورد بوسطة' });
+    } else {
+      res.json({ success:false, error:'HTTP '+r.status+': '+JSON.stringify(r.data) });
+    }
+  } catch(e) {
+    res.status(500).json({ success:false, error: e.message });
+  }
+});
+
+// Create Bosta delivery
+app.post('/api/bosta/create', async (req, res) => {
+  const { apiKey, env='production', locationId, order } = req.body;
+  if(!apiKey||!order) return res.status(400).json({ success:false, error:'بيانات ناقصة' });
+  
+  const nameParts = (order.name||'').trim().split(/\s+/);
+  const payload = {
+    type: 10, // SEND
+    specs: { packageDetails: { numberOfParcels: 1 } },
+    cod: order.paid ? 0 : (order.total||0),
+    dropOffAddress: {
+      city: order.area||'القاهرة',
+      firstLine: order.addr||order.area||'—',
+    },
+    receiver: {
+      firstName: nameParts[0]||'عميل',
+      lastName: nameParts.slice(1).join(' ')||'.',
+      phone: (order.phone||'01000000000').replace(/[^0-9+]/g,''),
+    },
+    businessReference: order.id,
+    notes: order.note||'',
+  };
+  if(locationId) payload.pickupAddress = { _id: locationId };
+
+  try {
+    const r = await bostaRequest(env, apiKey, '/deliveries', 'POST', payload);
+    if(r.status===200||r.status===201){
+      const d = r.data.data||r.data;
+      res.json({ success:true, deliveryId:d._id||d.id, trackingNumber:d.trackingNumber||d._id });
+    } else {
+      res.json({ success:false, error:'HTTP '+r.status+': '+(r.data.message||r.data.error||JSON.stringify(r.data)) });
+    }
+  } catch(e) {
+    res.status(500).json({ success:false, error: e.message });
+  }
+});
+
 app.listen(PORT, () => console.log('OrderPro Backend on port', PORT));
