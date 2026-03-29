@@ -16,7 +16,9 @@ function mapShopifyOrder(sh) {
   const shipping = sh.shipping_address || {};
   const customer = sh.customer || {};
   const shippingLine = (sh.shipping_lines || [])[0] || {};
-  const isSameDay = (shippingLine.title || '').toLowerCase().includes('same day');
+  const sm = (shippingLine.title || '').toLowerCase();
+  const isSameDay = sm.includes('same day');
+  const isPickupOrder = sm.includes('pick up') || sm.includes('pickup') || sm.includes('trivium');
   let status = 'جديد';
   if (sh.cancelled_at) status = 'ملغي';
   else if (sh.fulfillment_status === 'fulfilled') status = 'مكتمل';
@@ -35,7 +37,7 @@ function mapShopifyOrder(sh) {
     status,
     paid: sh.financial_status === 'paid',
     shippingMethod: shippingLine.title || '',
-    deliveryType: isSameDay ? 'express' : 'normal',
+    deliveryType: isPickupOrder ? 'pickup' : isSameDay ? 'express' : 'normal',
     note: sh.note || '',
     items: (sh.line_items || []).map(i => i.name + ' x' + i.quantity).join(', '),
     time: new Date(sh.created_at).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
