@@ -240,37 +240,65 @@ app.post('/api/import-shopify', async (req, res) => {
   try {
     const shopifyOrders = await fetchShopifyOrders(shopUrl, accessToken, since.toISOString());
     let imported = 0, updated = 0;
-    for (const sh of shopifyOrders) {
-      const o = mapShopifyOrder(sh);
-      if (!DB_ENABLED) {
-        // in-memory fallback
+
+    if (!DB_ENABLED) {
+      // in-memory fallback
+      for (const sh of shopifyOrders) {
+        const o = mapShopifyOrder(sh);
         const idx = memOrders.findIndex(x=>x.id===o.id||x.shopifyId===o.shopify_id);
         if (idx < 0) { memOrders.push({...o, shopifyId:o.shopify_id, courierId:null}); imported++; }
         else updated++;
-        continue;
       }
-      // PostgreSQL
-      const existing = await pool.query('SELECT id, courier_id FROM orders WHERE id=$1 OR shopify_id=$2', [o.id, o.shopify_id]);
-      if (existing.rows.length === 0) {
-        await pool.query(`
-          INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-          ON CONFLICT (id) DO NOTHING
-        `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.total, o.ship,
-            null, o.status, o.paid, o.shipping_method, o.delivery_type,
-            o.note, o.items, o.time, o.created_at]);
-        imported++;
-      } else {
-        if (!existing.rows[0].courier_id) {
+    } else {
+      // PostgreSQL - bulk upsert أسرع بكتير
+      const mappedOrders = shopifyOrders.map(sh => mapShopifyOrder(sh));
+      
+      // جيب كل الـ IDs الموجودة مرة واحدة بدل query لكل طلب
+      const allIds = mappedOrders.map(o => o.id);
+      const allShopifyIds = mappedOrders.map(o => o.shopify_id);
+      
+      const existingRows = await pool.query(
+        'SELECT id, shopify_id, courier_id FROM orders WHERE id = ANY($1) OR shopify_id = ANY($2)',
+        [allIds, allShopifyIds]
+      );
+      const existingMap = {};
+      existingRows.rows.forEach(r => {
+        existingMap[r.id] = r;
+        if (r.shopify_id) existingMap[r.shopify_id] = r;
+      });
+
+      // Bulk insert للجديد
+      const toInsert = mappedOrders.filter(o => !existingMap[o.id] && !existingMap[o.shopify_id]);
+      const toUpdate = mappedOrders.filter(o => {
+        const ex = existingMap[o.id] || existingMap[o.shopify_id];
+        return ex && !ex.courier_id;
+      });
+
+      // Insert الجديد بـ chunks
+      const CHUNK = 50;
+      for (let i = 0; i < toInsert.length; i += CHUNK) {
+        const chunk = toInsert.slice(i, i + CHUNK);
+        for (const o of chunk) {
           await pool.query(`
-            UPDATE orders SET name=$1, phone=$2, area=$3, addr=$4, total=$5,
-            status=$6, paid=$7, shipping_method=$8, delivery_type=$9,
-            note=$10, items=$11, updated_at=NOW()
-            WHERE id=$12
-          `, [o.name, o.phone, o.area, o.addr, o.total,
-              o.status, o.paid, o.shipping_method, o.delivery_type,
-              o.note, o.items, o.id]);
+            INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            ON CONFLICT (id) DO NOTHING
+          `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.total, o.ship,
+              null, o.status, o.paid, o.shipping_method, o.delivery_type,
+              o.note, o.items, o.time, o.created_at]);
         }
+        imported += chunk.length;
+      }
+
+      // Update الموجود
+      for (const o of toUpdate) {
+        await pool.query(`
+          UPDATE orders SET name=$1, phone=$2, area=$3, addr=$4, total=$5,
+          status=$6, paid=$7, shipping_method=$8, delivery_type=$9,
+          note=$10, items=$11, updated_at=NOW() WHERE id=$12
+        `, [o.name, o.phone, o.area, o.addr, o.total,
+            o.status, o.paid, o.shipping_method, o.delivery_type,
+            o.note, o.items, o.id]);
         updated++;
       }
     }
@@ -514,7 +542,8 @@ function fetchPage(host, accessToken, path) {
   return new Promise((resolve, reject) => {
     const req = https.request({
       hostname: host, path, method: 'GET',
-      headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' }
+      headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' },
+      timeout: 30000,
     }, (res) => {
       let data = '';
       const linkHeader = res.headers['link'] || '';
@@ -533,6 +562,7 @@ function fetchPage(host, accessToken, path) {
       });
     });
     req.on('error', reject);
+    req.on('timeout', () => { req.destroy(new Error('Shopify request timeout')); });
     req.end();
   });
 }
