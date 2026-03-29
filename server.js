@@ -434,7 +434,25 @@ app.post('/api/bosta/create', async (req, res) => {
     businessReference: order.id,
     notes: order.note || '',
   };
-  if (locationId) payload.pickupAddress = { _id: locationId };
+  // pickupAddress مطلوبة دايماً ببوسطة — لازم يكون فيها firstLine
+  if (locationId) {
+    payload.pickupAddress = {
+      _id: locationId,
+      firstLine: order.pickupAddress || 'المحل',
+      city: 'القاهرة',
+    };
+  } else if (order.pickupAddress) {
+    payload.pickupAddress = {
+      firstLine: order.pickupAddress,
+      city: 'القاهرة',
+    };
+  } else {
+    // fallback — اسم المحل كعنوان استلام
+    payload.pickupAddress = {
+      firstLine: order.businessName || 'المحل',
+      city: 'القاهرة',
+    };
+  }
   try {
     const r = await bostaRequest(env, apiKey, '/deliveries', 'POST', payload);
     if (r.status === 200 || r.status === 201) {
