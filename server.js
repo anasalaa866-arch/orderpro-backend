@@ -74,6 +74,31 @@ async function initDB() {
         read BOOLEAN DEFAULT false,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS check_books (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        bank TEXT,
+        account TEXT,
+        pages INTEGER DEFAULT 48,
+        note TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS checks (
+        id TEXT PRIMARY KEY,
+        num TEXT,
+        payee TEXT NOT NULL,
+        amount NUMERIC DEFAULT 0,
+        date DATE,
+        book_id TEXT,
+        invoice TEXT,
+        note TEXT,
+        img TEXT,
+        status TEXT DEFAULT 'pending',
+        done_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
     console.log('✅ Database tables ready');
   } catch (err) {
@@ -668,6 +693,89 @@ function shopifyRequest(host, accessToken, path, method = 'GET', body = null) {
     req.end();
   });
 }
+
+// ===== CHECK BOOKS API =====
+app.get('/api/check-books', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ books: [] });
+  const { rows } = await pool.query('SELECT * FROM check_books ORDER BY created_at');
+  res.json({ books: rows.map(r => ({ id:r.id, name:r.name, bank:r.bank, account:r.account, pages:r.pages, note:r.note })) });
+});
+
+app.post('/api/check-books', async (req, res) => {
+  const { id, name, bank, account, pages, note } = req.body;
+  if (!DB_ENABLED) return res.json({ book: req.body });
+  await pool.query(
+    'INSERT INTO check_books (id,name,bank,account,pages,note) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6',
+    [id, name, bank||'', account||'', pages||48, note||'']
+  );
+  res.json({ book: req.body });
+});
+
+app.delete('/api/check-books/:id', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ ok: true });
+  await pool.query('DELETE FROM check_books WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+});
+
+// ===== CHECKS API =====
+app.get('/api/checks', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ checks: [] });
+  const { rows } = await pool.query('SELECT * FROM checks ORDER BY date ASC');
+  res.json({ checks: rows.map(r => ({
+    id:r.id, num:r.num, payee:r.payee, amount:parseFloat(r.amount),
+    date:r.date ? r.date.toISOString().slice(0,10) : '',
+    bookId:r.book_id, invoice:r.invoice, note:r.note,
+    img:r.img, status:r.status,
+    doneAt:r.done_at, createdAt:r.created_at,
+  })) });
+});
+
+app.post('/api/checks', async (req, res) => {
+  const { id, num, payee, amount, date, bookId, invoice, note, img, status, doneAt } = req.body;
+  if (!DB_ENABLED) return res.json({ check: req.body });
+  await pool.query(
+    `INSERT INTO checks (id,num,payee,amount,date,book_id,invoice,note,img,status,done_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+     ON CONFLICT (id) DO UPDATE SET
+     num=$2,payee=$3,amount=$4,date=$5,book_id=$6,invoice=$7,note=$8,img=$9,status=$10,done_at=$11`,
+    [id, num, payee, amount||0, date||null, bookId||null, invoice||'', note||'', img||'', status||'pending', doneAt||null]
+  );
+  res.json({ check: req.body });
+});
+
+app.delete('/api/checks/:id', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ ok: true });
+  await pool.query('DELETE FROM checks WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+});
+
+// Sync bulk - يستقبل كل الشيكات والدفاتر مرة واحدة
+app.post('/api/sync-checks', async (req, res) => {
+  const { books, checks } = req.body;
+  if (!DB_ENABLED) return res.json({ ok: true });
+  try {
+    // sync books
+    for (const b of (books||[])) {
+      await pool.query(
+        'INSERT INTO check_books (id,name,bank,account,pages,note) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6',
+        [b.id, b.name, b.bank||'', b.account||'', b.pages||48, b.note||'']
+      );
+    }
+    // sync checks
+    for (const c of (checks||[])) {
+      await pool.query(
+        `INSERT INTO checks (id,num,payee,amount,date,book_id,invoice,note,img,status,done_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         ON CONFLICT (id) DO UPDATE SET
+         num=$2,payee=$3,amount=$4,date=$5,book_id=$6,invoice=$7,note=$8,status=$10,done_at=$11`,
+        [c.id, c.num, c.payee, c.amount||0, c.date||null, c.bookId||null, c.invoice||'', c.note||'', c.img||'', c.status||'pending', c.doneAt||null]
+      );
+    }
+    res.json({ ok: true, books: (books||[]).length, checks: (checks||[]).length });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ===== HEALTH =====
 app.get('/', async (req, res) => {
