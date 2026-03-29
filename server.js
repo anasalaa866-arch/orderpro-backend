@@ -18,7 +18,8 @@ function mapShopifyOrder(sh) {
   const shippingLine = (sh.shipping_lines || [])[0] || {};
   const sm = (shippingLine.title || '').toLowerCase();
   const isSameDay = sm.includes('same day');
-  const isPickupOrder = sm.includes('pick up') || sm.includes('pickup') || sm.includes('trivium');
+  const isPickupOrder = (sm.includes('pick up') || sm.includes('pickup') || sm.includes('trivium')) && !sm.includes('transit');
+  const isTransitOrder = sm.includes('transit') || sm.includes('مخزن العبور') || sm.includes('عبور');
   let status = 'جديد';
   if (sh.cancelled_at) status = 'ملغي';
   else if (sh.fulfillment_status === 'fulfilled') status = 'مكتمل';
@@ -37,7 +38,7 @@ function mapShopifyOrder(sh) {
     status,
     paid: sh.financial_status === 'paid',
     shippingMethod: shippingLine.title || '',
-    deliveryType: isPickupOrder ? 'pickup' : isSameDay ? 'express' : 'normal',
+    deliveryType: isTransitOrder ? 'transit' : isPickupOrder ? 'pickup' : isSameDay ? 'express' : 'normal',
     note: sh.note || '',
     items: (sh.line_items || []).map(i => i.name + ' x' + i.quantity).join(', '),
     time: new Date(sh.created_at).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
@@ -67,37 +68,107 @@ app.post('/api/import-shopify', async (req, res) => {
   const since = new Date();
   since.setDate(since.getDate() - days);
   try {
-    const shopifyOrders = await fetchShopifyOrders(shopUrl, accessToken, since.toISOString());
+    let fetched = 0;
+    const shopifyOrders = await fetchShopifyOrders(
+      shopUrl, accessToken, since.toISOString(),
+      (count) => { fetched = count; }
+    );
     let imported = 0, updated = 0;
     for (const sh of shopifyOrders) {
       const order = mapShopifyOrder(sh);
       const idx = orders.findIndex(o => o.shopifyId === order.shopifyId);
-      if (idx >= 0) { if (!orders[idx].courierId) orders[idx] = { ...orders[idx], ...order }; updated++; }
-      else { orders.push(order); imported++; }
+      if (idx >= 0) {
+        if (!orders[idx].courierId) orders[idx] = { ...orders[idx], ...order };
+        updated++;
+      } else {
+        orders.push(order);
+        imported++;
+      }
     }
     orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    console.log(`Import: ${imported} new, ${updated} updated`);
-    res.json({ success: true, imported, updated, total: shopifyOrders.length, message: `تم استيراد ${imported} طلب جديد وتحديث ${updated} طلب` });
+    console.log(`Import done: ${imported} new, ${updated} updated, ${shopifyOrders.length} total`);
+    res.json({
+      success: true,
+      imported,
+      updated,
+      total: shopifyOrders.length,
+      pages: Math.ceil(shopifyOrders.length / 250),
+      message: `تم استيراد ${imported} طلب جديد وتحديث ${updated} طلب (إجمالي ${shopifyOrders.length} طلب من Shopify)`
+    });
   } catch (err) {
+    console.error('Import error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-function fetchShopifyOrders(shopUrl, accessToken, sinceDate) {
+// جلب صفحة واحدة من Shopify
+function fetchPage(host, accessToken, path) {
   return new Promise((resolve, reject) => {
-    const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
-    const path = `/admin/api/2024-01/orders.json?status=any&created_at_min=${sinceDate}&limit=250`;
-    const req = https.request({ hostname: host, path, method: 'GET', headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' } }, (response) => {
+    const req = https.request({
+      hostname: host, path, method: 'GET',
+      headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' }
+    }, (res) => {
       let data = '';
-      response.on('data', c => data += c);
-      response.on('end', () => {
-        try { const p = JSON.parse(data); if (p.errors) reject(new Error(JSON.stringify(p.errors))); else resolve(p.orders || []); }
-        catch (e) { reject(new Error('فشل في قراءة رد Shopify')); }
+      // استخراج link header للـ pagination
+      const linkHeader = res.headers['link'] || '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try {
+          const p = JSON.parse(data);
+          if (p.errors) return reject(new Error(JSON.stringify(p.errors)));
+          // استخراج رابط الصفحة التالية من Link header
+          let nextUrl = null;
+          if (linkHeader) {
+            const match = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+            if (match) {
+              // نأخذ الـ path فقط من الـ URL
+              try {
+                const u = new URL(match[1]);
+                nextUrl = u.pathname + u.search;
+              } catch(e) {
+                nextUrl = match[1];
+              }
+            }
+          }
+          resolve({ orders: p.orders || [], nextUrl });
+        } catch (e) { reject(new Error('فشل في قراءة رد Shopify')); }
       });
     });
     req.on('error', reject);
     req.end();
   });
+}
+
+// جلب كل الطلبات مع pagination تلقائي
+async function fetchShopifyOrders(shopUrl, accessToken, sinceDate, onProgress) {
+  const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  let path = `/admin/api/2024-01/orders.json?status=any&created_at_min=${encodeURIComponent(sinceDate)}&limit=250&order=created_at+desc`;
+  
+  let allOrders = [];
+  let pageNum = 1;
+
+  while (path) {
+    console.log(`📄 جلب صفحة ${pageNum}... (${allOrders.length} طلب حتى الآن)`);
+    const { orders, nextUrl } = await fetchPage(host, accessToken, path);
+    allOrders = allOrders.concat(orders);
+    
+    if (onProgress) onProgress(allOrders.length);
+    
+    // لو مفيش صفحة تانية أو الصفحة فارغة، وقف
+    if (!nextUrl || orders.length === 0) break;
+    
+    path = nextUrl;
+    pageNum++;
+    
+    // حماية — max 20 صفحة (5000 طلب)
+    if (pageNum > 20) {
+      console.log('⚠️ وصلنا لحد 5000 طلب');
+      break;
+    }
+  }
+  
+  console.log(`✅ انتهى الاستيراد: ${allOrders.length} طلب إجمالي`);
+  return allOrders;
 }
 
 app.get('/api/orders', (req, res) => res.json({ orders, total: orders.length }));
