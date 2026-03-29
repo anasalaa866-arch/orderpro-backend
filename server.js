@@ -48,6 +48,7 @@ async function initDB() {
         bosta_awb_url TEXT,
         bosta_awb_base64 TEXT,
         bosta_status TEXT,
+        has_problem BOOLEAN DEFAULT false,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
@@ -131,7 +132,7 @@ function rowToOrder(r) {
     note: r.note, items: r.items, time: r.time,
     bostaId: r.bosta_id, bostaTrackingNo: r.bosta_tracking,
     bostaAwbUrl: r.bosta_awb_url, bostaAwbBase64: r.bosta_awb_base64,
-    bostaStatus: r.bosta_status,
+    bostaStatus: r.bosta_status, hasProblem: r.has_problem || false,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -213,6 +214,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     note:'note', bostaId:'bosta_id', bostaTrackingNo:'bosta_tracking',
     bostaAwbUrl:'bosta_awb_url', bostaAwbBase64:'bosta_awb_base64',
     bostaStatus:'bosta_status', deliveryType:'delivery_type',
+    hasProblem:'has_problem',
   };
   Object.entries(b).forEach(([k, v]) => {
     if (map[k]) { sets.push(`${map[k]}=$${vals.length+1}`); vals.push(v); }
@@ -624,16 +626,19 @@ app.post('/api/shopify/assign', async (req, res) => {
         }));
         
         if (lineItems.some(li => li.quantity > 0)) {
-          await shopifyRequest(host, accessToken,
+          const fulfillR = await shopifyRequest(host, accessToken,
             `/admin/api/2024-01/fulfillments.json`, 'POST', {
               fulfillment: {
                 line_items_by_fulfillment_order: [
-                  { fulfillment_order_id: fo.id, fulfillment_order_line_items: lineItems }
+                  { fulfillment_order_id: fo.id }
                 ],
                 notify_customer: false,
-                tracking_info: { company: courierName },
+                tracking_company: courierName,
               }
             });
+          if (fulfillR.status !== 200 && fulfillR.status !== 201) {
+            errors.push('Fulfill HTTP ' + fulfillR.status + ': ' + JSON.stringify(fulfillR.data).slice(0,100));
+          }
         }
       }
     }
