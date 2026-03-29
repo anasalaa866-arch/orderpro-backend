@@ -110,7 +110,7 @@ function mapShopifyOrder(sh) {
     ship: 50,
     courier_id: null,
     status,
-    paid: sh.financial_status === 'paid',
+    paid: sh.financial_status === 'paid' || sh.financial_status === 'partially_paid',
     shipping_method: shippingLine.title || '',
     delivery_type: isTransitOrder ? 'transit' : isPickupOrder ? 'pickup' : isSameDay ? 'express' : 'normal',
     note: sh.note || '',
