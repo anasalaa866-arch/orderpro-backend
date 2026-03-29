@@ -7,13 +7,22 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ===== DATABASE =====
-const pool = new Pool({
+const DB_ENABLED = !!process.env.DATABASE_URL;
+const pool = DB_ENABLED ? new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
-});
+  ssl: { rejectUnauthorized: false },
+}) : null;
+
+console.log(DB_ENABLED ? '✅ PostgreSQL متصل' : '⚠️ بدون DB — استخدام الذاكرة');
+
+// fallback in-memory
+let memOrders = [];
+let memCouriers = [];
+let memNotifs = [];
 
 // إنشاء الجداول
 async function initDB() {
+  if (!DB_ENABLED) { console.log('⚠️ DATABASE_URL غير موجودة — شغّال بدون DB'); return; }
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS orders (
@@ -138,20 +147,23 @@ app.post('/webhook/shopify', async (req, res) => {
   const sh = JSON.parse(req.body);
   const o = mapShopifyOrder(sh);
   try {
-    await pool.query(`
-      INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-      ON CONFLICT (id) DO UPDATE SET
-        name=EXCLUDED.name, phone=EXCLUDED.phone, area=EXCLUDED.area,
-        addr=EXCLUDED.addr, total=EXCLUDED.total, status=EXCLUDED.status,
-        paid=EXCLUDED.paid, shipping_method=EXCLUDED.shipping_method,
-        delivery_type=EXCLUDED.delivery_type, note=EXCLUDED.note,
-        items=EXCLUDED.items, updated_at=NOW()
-    `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.total, o.ship,
-        o.courier_id, o.status, o.paid, o.shipping_method, o.delivery_type,
-        o.note, o.items, o.time, o.created_at]);
-    await pool.query(`INSERT INTO notifications (icon,title,sub) VALUES ($1,$2,$3)`,
-      ['📦', 'طلب جديد من Shopify', `${o.id} — ${o.name} — ${o.total} ج`]);
+    if (DB_ENABLED) {
+      await pool.query(`
+        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+        ON CONFLICT (id) DO UPDATE SET
+          name=EXCLUDED.name, phone=EXCLUDED.phone, area=EXCLUDED.area,
+          addr=EXCLUDED.addr, total=EXCLUDED.total, status=EXCLUDED.status,
+          paid=EXCLUDED.paid, shipping_method=EXCLUDED.shipping_method,
+          delivery_type=EXCLUDED.delivery_type, note=EXCLUDED.note,
+          items=EXCLUDED.items, updated_at=NOW()
+      `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.total, o.ship,
+          o.courier_id, o.status, o.paid, o.shipping_method, o.delivery_type,
+          o.note, o.items, o.time, o.created_at]);
+    } else {
+      const idx = memOrders.findIndex(x=>x.id===o.id);
+      if (idx<0) memOrders.unshift({...o, shopifyId:o.shopify_id, courierId:null});
+    }
     res.status(200).json({ received: true });
   } catch (err) {
     console.error('Webhook DB error:', err.message);
@@ -161,6 +173,7 @@ app.post('/webhook/shopify', async (req, res) => {
 
 // ===== ORDERS API =====
 app.get('/api/orders', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ orders: memOrders, total: memOrders.length });
   const { rows } = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
   res.json({ orders: rows.map(rowToOrder), total: rows.length });
 });
@@ -169,20 +182,31 @@ app.post('/api/orders', async (req, res) => {
   const o = req.body;
   const id = o.id || 'MN-' + Date.now();
   const now = new Date().toISOString();
+  const newOrder = { id, src:o.src||'manual', name:o.name, phone:o.phone||'—', area:o.area, addr:o.addr||o.area, total:o.total||0, ship:o.ship||50, courierId:o.courierId||null, status:o.status||'في الانتظار', paid:o.paid||false, deliveryType:o.deliveryType||'normal', note:o.note||'', items:o.items||'', time:o.time||new Date().toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}), createdAt:now };
+  if (!DB_ENABLED) {
+    if (!memOrders.find(x=>x.id===id)) memOrders.unshift(newOrder);
+    return res.json({ order: newOrder });
+  }
   await pool.query(`
     INSERT INTO orders (id,src,name,phone,area,addr,total,ship,courier_id,status,paid,delivery_type,note,items,time,created_at)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
     ON CONFLICT (id) DO NOTHING
-  `, [id, o.src||'manual', o.name, o.phone||'—', o.area, o.addr||o.area,
-      o.total||0, o.ship||50, o.courierId||null, o.status||'في الانتظار',
-      o.paid||false, o.deliveryType||'normal', o.note||'', o.items||'',
-      o.time||new Date().toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}), now]);
+  `, [id, newOrder.src, newOrder.name, newOrder.phone, newOrder.area, newOrder.addr,
+      newOrder.total, newOrder.ship, newOrder.courierId, newOrder.status,
+      newOrder.paid, newOrder.deliveryType, newOrder.note, newOrder.items,
+      newOrder.time, now]);
   const { rows } = await pool.query('SELECT * FROM orders WHERE id=$1', [id]);
   res.json({ order: rowToOrder(rows[0]) });
 });
 
 app.patch('/api/orders/:id', async (req, res) => {
   const b = req.body;
+  if (!DB_ENABLED) {
+    const o = memOrders.find(x=>x.id===req.params.id);
+    if (!o) return res.status(404).json({ error: 'not found' });
+    Object.assign(o, b);
+    return res.json({ order: o });
+  }
   const sets = [], vals = [];
   const map = {
     courierId:'courier_id', status:'status', paid:'paid', ship:'ship',
@@ -202,6 +226,7 @@ app.patch('/api/orders/:id', async (req, res) => {
 });
 
 app.delete('/api/orders/:id', async (req, res) => {
+  if (!DB_ENABLED) { memOrders = memOrders.filter(o=>o.id!==req.params.id); return res.json({ ok:true }); }
   await pool.query('DELETE FROM orders WHERE id=$1', [req.params.id]);
   res.json({ ok: true });
 });
@@ -217,10 +242,16 @@ app.post('/api/import-shopify', async (req, res) => {
     let imported = 0, updated = 0;
     for (const sh of shopifyOrders) {
       const o = mapShopifyOrder(sh);
-      // تحقق لو الطلب موجود
-      const existing = await pool.query('SELECT id, courier_id FROM orders WHERE id=$1', [o.id]);
+      if (!DB_ENABLED) {
+        // in-memory fallback
+        const idx = memOrders.findIndex(x=>x.id===o.id||x.shopifyId===o.shopify_id);
+        if (idx < 0) { memOrders.push({...o, shopifyId:o.shopify_id, courierId:null}); imported++; }
+        else updated++;
+        continue;
+      }
+      // PostgreSQL
+      const existing = await pool.query('SELECT id, courier_id FROM orders WHERE id=$1 OR shopify_id=$2', [o.id, o.shopify_id]);
       if (existing.rows.length === 0) {
-        // طلب جديد — أضفه
         await pool.query(`
           INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
@@ -230,7 +261,6 @@ app.post('/api/import-shopify', async (req, res) => {
             o.note, o.items, o.time, o.created_at]);
         imported++;
       } else {
-        // طلب موجود — حدّث البيانات من Shopify بس لو مفيش مندوب معين
         if (!existing.rows[0].courier_id) {
           await pool.query(`
             UPDATE orders SET name=$1, phone=$2, area=$3, addr=$4, total=$5,
@@ -254,6 +284,7 @@ app.post('/api/import-shopify', async (req, res) => {
 
 // ===== COURIERS API =====
 app.get('/api/couriers', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ couriers: memCouriers });
   const { rows } = await pool.query('SELECT * FROM couriers ORDER BY id');
   res.json({ couriers: rows.map(r => ({
     id: r.id, name: r.name, phone: r.phone, zone: r.zone,
@@ -264,6 +295,12 @@ app.get('/api/couriers', async (req, res) => {
 
 app.post('/api/couriers', async (req, res) => {
   const c = req.body;
+  if (!DB_ENABLED) {
+    const id = memCouriers.length ? Math.max(...memCouriers.map(x=>x.id))+1 : 1;
+    const nc = {id, name:c.name, phone:c.phone, zone:c.zone||'غير محدد', vehicle:c.vehicle||'دراجة بخارية', ship:c.ship||50, shipExpress:c.shipExpress||80, status:c.status||'متاح', settled:false};
+    memCouriers.push(nc);
+    return res.json({ courier: nc });
+  }
   const { rows } = await pool.query(`
     INSERT INTO couriers (name,phone,zone,vehicle,ship,ship_express,status)
     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
@@ -274,6 +311,11 @@ app.post('/api/couriers', async (req, res) => {
 
 app.patch('/api/couriers/:id', async (req, res) => {
   const b = req.body;
+  if (!DB_ENABLED) {
+    const c = memCouriers.find(x=>x.id==req.params.id);
+    if (c) Object.assign(c, b);
+    return res.json({ courier: c });
+  }
   const map = { name:'name', phone:'phone', zone:'zone', vehicle:'vehicle',
     ship:'ship', shipExpress:'ship_express', status:'status', settled:'settled' };
   const sets = [], vals = [];
@@ -288,12 +330,14 @@ app.patch('/api/couriers/:id', async (req, res) => {
 });
 
 app.delete('/api/couriers/:id', async (req, res) => {
+  if (!DB_ENABLED) { memCouriers = memCouriers.filter(x=>x.id!=req.params.id); return res.json({ ok:true }); }
   await pool.query('DELETE FROM couriers WHERE id=$1', [req.params.id]);
   res.json({ ok: true });
 });
 
 // ===== NOTIFICATIONS =====
 app.get('/api/notifications', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ notifications: memNotifs.slice(0,100) });
   const { rows } = await pool.query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 100');
   res.json({ notifications: rows });
 });
@@ -310,6 +354,11 @@ app.patch('/api/notifications/read-all', async (req, res) => {
 
 app.post('/api/notifications', async (req, res) => {
   const { icon, title, sub } = req.body;
+  if (!DB_ENABLED) {
+    const n = {id:Date.now(), icon:icon||'📌', title:title||'', sub:sub||'', read:false, created_at:new Date().toISOString()};
+    memNotifs.unshift(n);
+    return res.json({ notification: n });
+  }
   const { rows } = await pool.query(
     'INSERT INTO notifications (icon,title,sub) VALUES ($1,$2,$3) RETURNING *',
     [icon||'📌', title||'', sub||'']
@@ -403,16 +452,18 @@ app.post('/api/bosta/create', async (req, res) => {
         }
       } catch (awbErr) { console.log('AWB fetch failed:', awbErr.message); }
 
-      // حفظ في قاعدة البيانات
+      // حفظ في قاعدة البيانات أو الذاكرة
       if (order.id) {
-        await pool.query(`
-          UPDATE orders SET bosta_id=$1, bosta_tracking=$2, bosta_awb_url=$3,
-          bosta_awb_base64=$4, bosta_status='created', updated_at=NOW()
-          WHERE id=$5
-        `, [deliveryId, trackingNumber, awbUrl, awbBase64, order.id]);
-
-        await pool.query(`INSERT INTO notifications (icon,title,sub) VALUES ($1,$2,$3)`,
-          ['🚚', 'تم رفع بوليصة بوسطة', `${order.id} — تتبع: ${trackingNumber}`]);
+        if (DB_ENABLED) {
+          await pool.query(`
+            UPDATE orders SET bosta_id=$1, bosta_tracking=$2, bosta_awb_url=$3,
+            bosta_awb_base64=$4, bosta_status='created', updated_at=NOW()
+            WHERE id=$5
+          `, [deliveryId, trackingNumber, awbUrl, awbBase64, order.id]);
+        } else {
+          const o = memOrders.find(x=>x.id===order.id);
+          if (o) { o.bostaId=deliveryId; o.bostaTrackingNo=trackingNumber; o.bostaAwbBase64=awbBase64; }
+        }
       }
 
       res.json({ success: true, deliveryId, trackingNumber, hasAwb: !!awbBase64 });
@@ -424,6 +475,13 @@ app.post('/api/bosta/create', async (req, res) => {
 
 // جلب الـ AWB لطلب موجود
 app.get('/api/bosta/awb/:orderId', async (req, res) => {
+  if (!DB_ENABLED) {
+    const o = memOrders.find(x=>x.id===req.params.orderId);
+    if (!o) return res.status(404).json({ error: 'الطلب مش موجود' });
+    return o.bostaAwbBase64
+      ? res.json({ success:true, awbBase64:o.bostaAwbBase64 })
+      : res.json({ success:false, bostaId:o.bostaId, error:'البوليصة مش محفوظة' });
+  }
   const { rows } = await pool.query('SELECT bosta_awb_base64, bosta_awb_url, bosta_id FROM orders WHERE id=$1', [req.params.orderId]);
   if (!rows[0]) return res.status(404).json({ error: 'الطلب مش موجود' });
   if (rows[0].bosta_awb_base64) {
@@ -477,11 +535,19 @@ async function fetchShopifyOrders(shopUrl, accessToken, sinceDate) {
 // ===== HEALTH =====
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0;
-  try { const r = await pool.query('SELECT COUNT(*) FROM orders'); orderCount = parseInt(r.rows[0].count); dbOk = true; } catch {}
-  res.json({ status: '✅ OrderPro Backend شغال', db: dbOk ? '✅ متصل' : '❌ منفصل', orders: orderCount, uptime: Math.floor(process.uptime()) + ' ثانية' });
+  if (DB_ENABLED) {
+    try { const r = await pool.query('SELECT COUNT(*) FROM orders'); orderCount = parseInt(r.rows[0].count); dbOk = true; } catch {}
+  } else {
+    orderCount = memOrders.length;
+  }
+  res.json({ status: '✅ OrderPro Backend شغال', db: DB_ENABLED ? (dbOk ? '✅ متصل' : '❌ منفصل') : '⚠️ بدون DB', orders: orderCount, uptime: Math.floor(process.uptime()) + ' ثانية' });
 });
 
 // ===== START =====
-initDB().then(() => {
-  app.listen(PORT, () => console.log('🚀 OrderPro Backend on port', PORT));
-});
+if (DB_ENABLED) {
+  initDB().then(() => {
+    app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT));
+  });
+} else {
+  app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT, '(بدون DB)'));
+}
