@@ -217,19 +217,32 @@ app.post('/api/import-shopify', async (req, res) => {
     let imported = 0, updated = 0;
     for (const sh of shopifyOrders) {
       const o = mapShopifyOrder(sh);
-      const { rowCount } = await pool.query(`
-        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-        ON CONFLICT (id) DO UPDATE SET
-          name=EXCLUDED.name, phone=EXCLUDED.phone, area=EXCLUDED.area,
-          status=CASE WHEN orders.courier_id IS NOT NULL THEN orders.status ELSE EXCLUDED.status END,
-          updated_at=NOW()
-        WHERE orders.courier_id IS NULL
-      `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.total, o.ship,
-          null, o.status, o.paid, o.shipping_method, o.delivery_type,
-          o.note, o.items, o.time, o.created_at]);
-      if (rowCount > 0) imported++;
-      else updated++;
+      // تحقق لو الطلب موجود
+      const existing = await pool.query('SELECT id, courier_id FROM orders WHERE id=$1', [o.id]);
+      if (existing.rows.length === 0) {
+        // طلب جديد — أضفه
+        await pool.query(`
+          INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+          ON CONFLICT (id) DO NOTHING
+        `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.total, o.ship,
+            null, o.status, o.paid, o.shipping_method, o.delivery_type,
+            o.note, o.items, o.time, o.created_at]);
+        imported++;
+      } else {
+        // طلب موجود — حدّث البيانات من Shopify بس لو مفيش مندوب معين
+        if (!existing.rows[0].courier_id) {
+          await pool.query(`
+            UPDATE orders SET name=$1, phone=$2, area=$3, addr=$4, total=$5,
+            status=$6, paid=$7, shipping_method=$8, delivery_type=$9,
+            note=$10, items=$11, updated_at=NOW()
+            WHERE id=$12
+          `, [o.name, o.phone, o.area, o.addr, o.total,
+              o.status, o.paid, o.shipping_method, o.delivery_type,
+              o.note, o.items, o.id]);
+        }
+        updated++;
+      }
     }
     res.json({ success: true, imported, updated, total: shopifyOrders.length,
       pages: Math.ceil(shopifyOrders.length / 250),
