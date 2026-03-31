@@ -49,6 +49,7 @@ async function initDB() {
         bosta_awb_base64 TEXT,
         bosta_status TEXT,
         has_problem BOOLEAN DEFAULT false,
+        assigned_zone TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
@@ -240,6 +241,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     bostaAwbUrl:'bosta_awb_url', bostaAwbBase64:'bosta_awb_base64',
     bostaStatus:'bosta_status', deliveryType:'delivery_type',
     hasProblem:'has_problem',
+    assignedZone:'assigned_zone',
   };
   Object.entries(b).forEach(([k, v]) => {
     if (map[k]) { sets.push(`${map[k]}=$${vals.length+1}`); vals.push(v); }
