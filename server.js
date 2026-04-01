@@ -474,6 +474,35 @@ app.post('/api/bosta/test', async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+
+// Bosta AWB PDF
+app.post('/api/bosta/awb', async (req, res) => {
+  const { apiKey, env, deliveryId } = req.body;
+  if(!apiKey || !deliveryId) return res.json({success:false, error:'Missing params'});
+  const baseUrl = env==='staging' 
+    ? 'https://staging.bosta.co/api/v2'
+    : 'https://app.bosta.co/api/v2';
+  try {
+    const r = await fetch(`${baseUrl}/deliveries/${deliveryId}/awb`, {
+      headers: { Authorization: apiKey, 'Content-Type': 'application/json' }
+    });
+    const data = await r.json();
+    if(data && data.base64) {
+      return res.json({success:true, base64: data.base64});
+    }
+    // بعض الـ APIs بترجع URL مش base64
+    if(data && data.url) {
+      const pdfR = await fetch(data.url);
+      const buf = await pdfR.arrayBuffer();
+      const base64 = Buffer.from(buf).toString('base64');
+      return res.json({success:true, base64});
+    }
+    return res.json({success:false, error: JSON.stringify(data)});
+  } catch(e) {
+    return res.json({success:false, error: e.message});
+  }
+});
+
 app.post('/api/bosta/create', async (req, res) => {
   const { apiKey, env = 'production', locationId, order } = req.body;
   if (!apiKey || !order) return res.status(400).json({ success: false, error: 'بيانات ناقصة' });
