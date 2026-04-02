@@ -36,6 +36,7 @@ async function initDB() {
         total NUMERIC DEFAULT 0,
         ship NUMERIC DEFAULT 50,
         courier_id INTEGER,
+        is_bosta BOOLEAN DEFAULT false,
         status TEXT DEFAULT 'جديد',
         paid BOOLEAN DEFAULT false,
         shipping_method TEXT,
@@ -153,7 +154,8 @@ function rowToOrder(r) {
     id: r.id, shopifyId: r.shopify_id, src: r.src, name: r.name,
     phone: r.phone, area: r.area, addr: r.addr,
     total: parseFloat(r.total) || 0, ship: parseFloat(r.ship) || 50,
-    courierId: r.courier_id, status: r.status, paid: r.paid,
+    courierId: r.is_bosta ? 'bosta' : r.courier_id,
+    isBosta: r.is_bosta || false, status: r.status, paid: r.paid,
     shippingMethod: r.shipping_method, deliveryType: r.delivery_type,
     note: r.note, items: r.items, time: r.time,
     bostaId: r.bosta_id, bostaTrackingNo: r.bosta_tracking,
@@ -236,7 +238,7 @@ app.patch('/api/orders/:id', async (req, res) => {
   }
   const sets = [], vals = [];
   const map = {
-    courierId:'courier_id', status:'status', paid:'paid', ship:'ship',
+    courierId:'courier_id', isBosta:'is_bosta', status:'status', paid:'paid', ship:'ship',
     note:'note', bostaId:'bosta_id', bostaTrackingNo:'bosta_tracking',
     bostaAwbUrl:'bosta_awb_url', bostaAwbBase64:'bosta_awb_base64',
     bostaStatus:'bosta_status', deliveryType:'delivery_type',
