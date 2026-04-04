@@ -5,6 +5,14 @@ const https = require('https');
 const { Pool } = require('pg');
 const app = express();
 
+// Global error handlers - prevent crashes
+process.on('uncaughtException', (err) => {
+  console.error('❌ Uncaught Exception:', err.message, err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ Unhandled Rejection:', reason);
+});
+
 // ===== HTTPS Helper (compatible with all Node versions) =====
 function httpsRequest(url, options={}, body=null) {
   return new Promise((resolve, reject) => {
