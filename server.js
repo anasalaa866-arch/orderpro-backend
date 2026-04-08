@@ -438,21 +438,6 @@ app.patch('/api/couriers/:id', async (req, res) => {
   res.json({ courier: rows[0] });
 });
 
-// حذف كل المناديب دفعة واحدة
-app.delete('/api/couriers', async (req, res) => {
-  if(!DB_ENABLED){
-    memCouriers=[];
-    return res.json({success:true, deleted: 0});
-  }
-  try{
-    const r = await pool.query('DELETE FROM couriers RETURNING id');
-    console.log('Deleted all couriers:', r.rowCount);
-    return res.json({success:true, deleted: r.rowCount});
-  }catch(e){
-    return res.status(500).json({error:e.message});
-  }
-});
-
 app.delete('/api/couriers/:id', async (req, res) => {
   if (!DB_ENABLED) { memCouriers = memCouriers.filter(x=>x.id!=req.params.id); return res.json({ ok:true }); }
   await pool.query('DELETE FROM couriers WHERE id=$1', [req.params.id]);
