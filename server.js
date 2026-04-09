@@ -139,6 +139,7 @@ async function initDB() {
 
     // Safe column migrations
     const migrations = [
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS addr2 TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_bosta BOOLEAN DEFAULT false",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS has_problem BOOLEAN DEFAULT false",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS assigned_zone TEXT",
@@ -184,6 +185,7 @@ function mapShopifyOrder(sh) {
     phone: shipping.phone || customer.phone || '—',
     area: [shipping.city, shipping.address1].filter(Boolean).join(' - ') || '—',
     addr: [shipping.address1, shipping.address2, shipping.city].filter(Boolean).join('، ') || '—',
+    addr2: shipping.address2 || '',
     total: parseFloat(sh.total_price) || 0,
     ship: 50,
     courier_id: null,
@@ -204,6 +206,7 @@ function rowToOrder(r) {
     id: r.id, shopifyId: r.shopify_id, src: r.src, name: r.name,
     phone: r.phone, area: r.area, addr: r.addr,
     total: parseFloat(r.total) || 0, ship: parseFloat(r.ship) || 50,
+    addr2: r.addr2 || '',
     courierId: r.is_bosta ? 'bosta' : r.courier_id,
     isBosta: r.is_bosta || false, status: r.status, paid: r.paid,
     shippingMethod: r.shipping_method, deliveryType: r.delivery_type,
@@ -228,15 +231,15 @@ app.post('/webhook/shopify', async (req, res) => {
   try {
     if (DB_ENABLED) {
       await pool.query(`
-        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,addr2,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
         ON CONFLICT (id) DO UPDATE SET
           name=EXCLUDED.name, phone=EXCLUDED.phone, area=EXCLUDED.area,
-          addr=EXCLUDED.addr, total=EXCLUDED.total, status=EXCLUDED.status,
+          addr=EXCLUDED.addr, addr2=EXCLUDED.addr2, total=EXCLUDED.total, status=EXCLUDED.status,
           paid=EXCLUDED.paid, shipping_method=EXCLUDED.shipping_method,
           delivery_type=EXCLUDED.delivery_type, note=EXCLUDED.note,
           items=EXCLUDED.items, updated_at=NOW()
-      `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.total, o.ship,
+      `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.addr2||'', o.total, o.ship,
           o.courier_id, o.status, o.paid, o.shipping_method, o.delivery_type,
           o.note, o.items, o.time, o.created_at]);
     } else {
