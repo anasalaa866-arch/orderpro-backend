@@ -135,6 +135,17 @@ async function initDB() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    // جدول المستخدمين
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        pass_hash TEXT NOT NULL,
+        pages TEXT DEFAULT '[]',
+        active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
     console.log('✅ Database tables ready');
 
     // Safe column migrations
@@ -866,7 +877,59 @@ app.get('/', async (req, res) => {
 
 // ===== START =====
 if (DB_ENABLED) {
-  initDB().then(() => {
+  // ===== USERS API =====
+app.get('/api/users', async (req, res) => {
+  if(!DB_ENABLED) return res.json({users:[]});
+  try{
+    const r = await pool.query('SELECT username,name,pages,active FROM users ORDER BY created_at');
+    res.json({users: r.rows.map(u=>({
+      username: u.username, name: u.name,
+      pages: JSON.parse(u.pages||'[]'), active: u.active
+    }))});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/users', async (req, res) => {
+  const {username, name, passHash, pages, active=true} = req.body;
+  if(!username||!name||!passHash) return res.status(400).json({error:'Missing fields'});
+  if(!DB_ENABLED) return res.json({success:true});
+  try{
+    await pool.query(
+      `INSERT INTO users(username,name,pass_hash,pages,active) VALUES($1,$2,$3,$4,$5)
+       ON CONFLICT(username) DO UPDATE SET name=$2,pass_hash=$3,pages=$4,active=$5`,
+      [username, name, passHash, JSON.stringify(pages||[]), active]
+    );
+    res.json({success:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.delete('/api/users/:username', async (req, res) => {
+  if(!DB_ENABLED) return res.json({success:true});
+  try{
+    await pool.query('DELETE FROM users WHERE username=$1', [req.params.username]);
+    res.json({success:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Login endpoint
+app.post('/api/login', async (req, res) => {
+  const {username, passHash} = req.body;
+  if(!DB_ENABLED) return res.json({found:false});
+  try{
+    const r = await pool.query(
+      'SELECT username,name,pages,active FROM users WHERE username=$1 AND pass_hash=$2 AND active=true',
+      [username, passHash]
+    );
+    if(r.rows.length){
+      const u = r.rows[0];
+      res.json({found:true, user:{username:u.username, name:u.name, pages:JSON.parse(u.pages||'[]'), role:'custom', active:true}});
+    } else {
+      res.json({found:false});
+    }
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+initDB().then(() => {
     app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT));
   });
 } else {
