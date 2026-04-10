@@ -238,6 +238,26 @@ app.post('/webhook/shopify', async (req, res) => {
     if (hash !== hmac) return res.status(401).json({ error: 'Unauthorized' });
   }
   const sh = JSON.parse(req.body);
+  // لو الطلب ملغي وقبل التوزيع = لغيه بس
+  if (sh.cancelled_at) {
+    const orderId = 'SH-' + sh.order_number;
+    try {
+      if (DB_ENABLED) {
+        const existing = await pool.query('SELECT courier_id, status FROM orders WHERE id=$1', [orderId]);
+        if (existing.rows.length) {
+          const row = existing.rows[0];
+          if (!row.courier_id && row.status !== 'جاري التوصيل' && row.status !== 'مكتمل') {
+            await pool.query('UPDATE orders SET status=$1, updated_at=NOW() WHERE id=$2', ['ملغي', orderId]);
+            console.log('Order auto-cancelled:', orderId);
+          }
+        }
+      } else {
+        const o = memOrders.find(x => x.id === orderId);
+        if (o && !o.courierId && o.status !== 'جاري التوصيل') o.status = 'ملغي';
+      }
+    } catch(e) { console.error('Cancel error:', e.message); }
+    return res.status(200).json({ received: true });
+  }
   const o = mapShopifyOrder(sh);
   try {
     if (DB_ENABLED) {
@@ -877,7 +897,47 @@ app.get('/', async (req, res) => {
 
 // ===== START =====
 if (DB_ENABLED) {
-  // ===== USERS API =====
+  // ===== SHOPIFY CANCEL WEBHOOK =====
+app.post('/webhook/shopify/cancel', async (req, res) => {
+  const secret = process.env.SHOPIFY_WEBHOOK_SECRET || '';
+  if (secret) {
+    const hmac = req.headers['x-shopify-hmac-sha256'];
+    const hash = crypto.createHmac('sha256', secret).update(req.body).digest('base64');
+    if (hash !== hmac) return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const sh = JSON.parse(req.body);
+    const orderId = 'SH-' + sh.order_number;
+    // بلغي فقط لو الطلب لسه مش موزع (courier_id = null)
+    if (DB_ENABLED) {
+      const existing = await pool.query(
+        'SELECT status, courier_id FROM orders WHERE id=$1', [orderId]
+      );
+      if (existing.rows.length) {
+        const row = existing.rows[0];
+        // لو مش موزع بعد = لغيه
+        if (!row.courier_id && row.status !== 'جاري التوصيل' && row.status !== 'مكتمل') {
+          await pool.query(
+            'UPDATE orders SET status=$1, updated_at=NOW() WHERE id=$2',
+            ['ملغي', orderId]
+          );
+          console.log('Order cancelled from Shopify:', orderId);
+        }
+      }
+    } else {
+      const o = memOrders.find(x => x.id === orderId);
+      if (o && !o.courierId && o.status !== 'جاري التوصيل' && o.status !== 'مكتمل') {
+        o.status = 'ملغي';
+      }
+    }
+    res.status(200).json({ received: true });
+  } catch(e) {
+    console.error('Cancel webhook error:', e.message);
+    res.status(200).json({ received: true }); // دايماً 200 لـ Shopify
+  }
+});
+
+// ===== USERS API =====
 app.get('/api/users', async (req, res) => {
   if(!DB_ENABLED) return res.json({users:[]});
   try{
