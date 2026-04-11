@@ -157,6 +157,7 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS bosta_awb_url TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS bosta_awb_base64 TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shop_settled BOOLEAN DEFAULT false",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS bosta_exported BOOLEAN DEFAULT false",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER",
     ];
@@ -225,6 +226,8 @@ function rowToOrder(r) {
     bostaId: r.bosta_id, bostaTrackingNo: r.bosta_tracking,
     bostaAwbUrl: r.bosta_awb_url, bostaAwbBase64: r.bosta_awb_base64,
     bostaStatus: r.bosta_status, hasProblem: r.has_problem || false,
+    assignedZone: r.assigned_zone || null,
+    bostaExported: r.bosta_exported || false,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -328,6 +331,9 @@ app.patch('/api/orders/:id', async (req, res) => {
     bostaStatus:'bosta_status', deliveryType:'delivery_type',
     hasProblem:'has_problem',
     assignedZone:'assigned_zone',
+    bostaExported:'bosta_exported',
+    name:'name', phone:'phone', area:'area', addr:'addr',
+    items:'items', total:'total',
   };
   Object.entries(b).forEach(([k, v]) => {
     if (map[k]) { sets.push(`${map[k]}=$${vals.length+1}`); vals.push(v); }
@@ -941,9 +947,10 @@ app.post('/webhook/shopify/cancel', async (req, res) => {
 app.get('/api/users', async (req, res) => {
   if(!DB_ENABLED) return res.json({users:[]});
   try{
-    const r = await pool.query('SELECT username,name,pages,active FROM users ORDER BY created_at');
+    const r = await pool.query('SELECT username,name,pass_hash,pages,active FROM users ORDER BY created_at');
     res.json({users: r.rows.map(u=>({
       username: u.username, name: u.name,
+      passHash: u.pass_hash,
       pages: JSON.parse(u.pages||'[]'), active: u.active
     }))});
   }catch(e){ res.status(500).json({error:e.message}); }
