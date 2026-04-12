@@ -904,7 +904,93 @@ app.get('/', async (req, res) => {
 
 // ===== START =====
 if (DB_ENABLED) {
-  // ===== SHOPIFY CANCEL WEBHOOK =====
+  // ===== SHOPIFY ORDER UPDATE WEBHOOK =====
+app.post('/webhook/shopify/update', async (req, res) => {
+  const secret = process.env.SHOPIFY_WEBHOOK_SECRET || '';
+  if (secret) {
+    const hmac = req.headers['x-shopify-hmac-sha256'];
+    const hash = crypto.createHmac('sha256', secret).update(req.body).digest('base64');
+    if (hash !== hmac) return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const sh = JSON.parse(req.body);
+    const orderId = 'SH-' + sh.order_number;
+
+    if (!DB_ENABLED) {
+      res.status(200).json({ received: true });
+      return;
+    }
+
+    // شوف الطلب موجود في DB
+    const existing = await pool.query('SELECT * FROM orders WHERE id=$1', [orderId]);
+    if (!existing.rows.length) {
+      // طلب جديد - أضفه
+      const o = mapShopifyOrder(sh);
+      await pool.query(`
+        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,addr2,total,ship,
+          courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        ON CONFLICT (id) DO NOTHING`,
+        [o.id,o.shopify_id,o.src,o.name,o.phone,o.area,o.addr,o.addr2||'',
+         o.total,o.ship,null,o.status,o.paid,o.shipping_method,
+         o.delivery_type,o.note,o.items,o.time,o.created_at]);
+      return res.status(200).json({ received: true });
+    }
+
+    const row = existing.rows[0];
+
+    // لو الطلب ملغي
+    if (sh.cancelled_at) {
+      // لغيه بس لو مش موزع أو مكتمل
+      if (!row.courier_id && row.status !== 'جاري التوصيل' && row.status !== 'مكتمل') {
+        await pool.query(
+          'UPDATE orders SET status=$1, updated_at=NOW() WHERE id=$2',
+          ['ملغي', orderId]
+        );
+        console.log('Order cancelled via update webhook:', orderId);
+      }
+      return res.status(200).json({ received: true });
+    }
+
+    // تحديث البيانات القابلة للتغيير فقط
+    const shipping = sh.shipping_address || {};
+    const customer = sh.customer || {};
+    const shippingLine = (sh.shipping_lines || [])[0] || {};
+
+    const newName = shipping.first_name
+      ? (shipping.first_name + ' ' + (shipping.last_name || '')).trim()
+      : customer.first_name
+      ? (customer.first_name + ' ' + (customer.last_name || '')).trim()
+      : row.name;
+
+    const newPhone = shipping.phone || customer.phone || row.phone;
+    const newArea = [shipping.city, shipping.address1].filter(Boolean).join(' - ') || row.area;
+    const newAddr = [shipping.address1, shipping.address2, shipping.city].filter(Boolean).join('، ') || row.addr;
+    const newTotal = parseFloat(sh.total_price) || row.total;
+    const newPaid = sh.financial_status === 'paid' || sh.financial_status === 'partially_paid';
+    const newItems = (sh.line_items || []).map(i => i.name + ' x' + i.quantity).join(', ') || row.items;
+    const newNote = sh.note || row.note;
+
+    // حدّث بس لو الطلب مش موزع بعد
+    // لو موزع، حدّث البيانات الشخصية بس (اسم، هاتف، عنوان، مبلغ، منتجات)
+    await pool.query(`
+      UPDATE orders SET
+        name=$1, phone=$2, area=$3, addr=$4,
+        total=$5, paid=$6, items=$7, note=$8,
+        updated_at=NOW()
+      WHERE id=$9`,
+      [newName, newPhone, newArea, newAddr, newTotal, newPaid, newItems, newNote, orderId]
+    );
+
+    console.log('Order updated via webhook:', orderId, {name:newName, total:newTotal});
+    res.status(200).json({ received: true });
+  } catch(e) {
+    console.error('Update webhook error:', e.message);
+    res.status(200).json({ received: true });
+  }
+});
+
+// ===== SHOPIFY CANCEL WEBHOOK =====
 app.post('/webhook/shopify/cancel', async (req, res) => {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET || '';
   if (secret) {
