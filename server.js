@@ -269,10 +269,16 @@ app.post('/webhook/shopify', async (req, res) => {
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
         ON CONFLICT (id) DO UPDATE SET
           name=EXCLUDED.name, phone=EXCLUDED.phone, area=EXCLUDED.area,
-          addr=EXCLUDED.addr, addr2=EXCLUDED.addr2, total=EXCLUDED.total, status=EXCLUDED.status,
+          addr=EXCLUDED.addr, addr2=EXCLUDED.addr2, total=EXCLUDED.total,
           paid=EXCLUDED.paid, shipping_method=EXCLUDED.shipping_method,
           delivery_type=EXCLUDED.delivery_type, note=EXCLUDED.note,
-          items=EXCLUDED.items, updated_at=NOW()
+          items=EXCLUDED.items, updated_at=NOW(),
+          -- حدّث status بس لو الطلب ملغي على Shopify، أو لو لسه مش موزع
+          status=CASE
+            WHEN EXCLUDED.status='ملغي' THEN 'ملغي'
+            WHEN orders.status IN ('جاري التوصيل','مكتمل','ملغي') THEN orders.status
+            ELSE EXCLUDED.status
+          END
       `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.addr2||'', o.total, o.ship,
           o.courier_id, o.status, o.paid, o.shipping_method, o.delivery_type,
           o.note, o.items, o.time, o.created_at]);
