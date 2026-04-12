@@ -439,6 +439,7 @@ app.get('/api/couriers', async (req, res) => {
     id: r.id, name: r.name, phone: r.phone, zone: r.zone,
     vehicle: r.vehicle, ship: parseFloat(r.ship), shipExpress: parseFloat(r.ship_express),
     status: r.status, settled: r.settled,
+    settledAt: r.settled_at || null,
   })) });
 });
 
@@ -466,7 +467,7 @@ app.patch('/api/couriers/:id', async (req, res) => {
     return res.json({ courier: c });
   }
   const map = { name:'name', phone:'phone', zone:'zone', vehicle:'vehicle',
-    ship:'ship', shipExpress:'ship_express', status:'status', settled:'settled' };
+    ship:'ship', shipExpress:'ship_express', status:'status', settled:'settled', settledAt:'settled_at' };
   const sets = [], vals = [];
   Object.entries(b).forEach(([k, v]) => {
     if (map[k]) { sets.push(`${map[k]}=$${vals.length+1}`); vals.push(v); }
