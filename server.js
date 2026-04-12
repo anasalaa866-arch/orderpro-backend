@@ -146,6 +146,20 @@ async function initDB() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
+    // جدول التسويات
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settlements (
+        id SERIAL PRIMARY KEY,
+        courier_id INTEGER NOT NULL,
+        ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        order_ids TEXT DEFAULT '[]',
+        cod NUMERIC DEFAULT 0,
+        ship NUMERIC DEFAULT 0,
+        notes TEXT DEFAULT '',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+
     console.log('✅ Database tables ready');
 
     // Safe column migrations
@@ -910,7 +924,77 @@ app.get('/', async (req, res) => {
 
 // ===== START =====
 if (DB_ENABLED) {
-  // ===== SHOPIFY ORDER UPDATE WEBHOOK =====
+  // ===== SETTLEMENTS API =====
+
+// جيب كل تسويات مندوب
+app.get('/api/settlements/:courierId', async (req, res) => {
+  if(!DB_ENABLED) return res.json({settlements:[]});
+  try{
+    const r = await pool.query(
+      'SELECT * FROM settlements WHERE courier_id=$1 ORDER BY ts ASC',
+      [req.params.courierId]
+    );
+    res.json({settlements: r.rows.map(s=>({
+      id: s.id,
+      courierId: s.courier_id,
+      ts: s.ts,
+      orderIds: JSON.parse(s.order_ids||'[]'),
+      cod: parseFloat(s.cod)||0,
+      ship: parseFloat(s.ship)||0,
+      notes: s.notes||''
+    }))});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// جيب كل التسويات
+app.get('/api/settlements', async (req, res) => {
+  if(!DB_ENABLED) return res.json({settlements:[]});
+  try{
+    const r = await pool.query('SELECT * FROM settlements ORDER BY ts DESC LIMIT 500');
+    res.json({settlements: r.rows.map(s=>({
+      id: s.id,
+      courierId: s.courier_id,
+      ts: s.ts,
+      orderIds: JSON.parse(s.order_ids||'[]'),
+      cod: parseFloat(s.cod)||0,
+      ship: parseFloat(s.ship)||0,
+      notes: s.notes||''
+    }))});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// إضافة تسوية جديدة
+app.post('/api/settlements', async (req, res) => {
+  const {courierId, ts, orderIds, cod, ship, notes} = req.body;
+  if(!courierId) return res.status(400).json({error:'courierId required'});
+  if(!DB_ENABLED) return res.json({success:true, id:Date.now()});
+  try{
+    const r = await pool.query(
+      `INSERT INTO settlements(courier_id, ts, order_ids, cod, ship, notes)
+       VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [courierId, ts||new Date().toISOString(),
+       JSON.stringify(orderIds||[]),
+       cod||0, ship||0, notes||'']
+    );
+    // حدّث settled في couriers
+    await pool.query(
+      'UPDATE couriers SET settled=true WHERE id=$1',
+      [courierId]
+    );
+    res.json({success:true, id:r.rows[0].id});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// حذف تسوية (للتراجع)
+app.delete('/api/settlements/:id', async (req, res) => {
+  if(!DB_ENABLED) return res.json({success:true});
+  try{
+    await pool.query('DELETE FROM settlements WHERE id=$1', [req.params.id]);
+    res.json({success:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ===== SHOPIFY ORDER UPDATE WEBHOOK =====
 app.post('/webhook/shopify/update', async (req, res) => {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET || '';
   if (secret) {
