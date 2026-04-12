@@ -221,6 +221,7 @@ function mapShopifyOrder(sh) {
     delivery_type: isTransitOrder ? 'transit' : isPickupOrder ? 'pickup' : isSameDay ? 'express' : 'normal',
     note: sh.note || '',
     items: (sh.line_items || []).map(i => i.name + ' x' + i.quantity).join(', '),
+    province: (sh.shipping_address || {}).province_code || '',
     time: new Date(sh.created_at).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
     created_at: sh.created_at || new Date().toISOString(),
   };
@@ -233,6 +234,7 @@ function rowToOrder(r) {
     phone: r.phone, area: r.area, addr: r.addr,
     total: parseFloat(r.total) || 0, ship: parseFloat(r.ship) || 50,
     addr2: r.addr2 || '',
+    province: r.province || '',
     courierId: r.is_bosta ? 'bosta' : r.courier_id,
     isBosta: r.is_bosta || false, status: r.status, paid: r.paid,
     shippingMethod: r.shipping_method, deliveryType: r.delivery_type,
@@ -353,6 +355,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     assignedZone:'assigned_zone',
     bostaExported:'bosta_exported',
     name:'name', phone:'phone', area:'area', addr:'addr',
+    province:'province',
     items:'items', total:'total',
   };
   Object.entries(b).forEach(([k, v]) => {
@@ -1018,7 +1021,7 @@ app.post('/webhook/shopify/update', async (req, res) => {
       const o = mapShopifyOrder(sh);
       await pool.query(`
         INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,addr2,total,ship,
-          courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
+          courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at,province)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
         ON CONFLICT (id) DO NOTHING`,
         [o.id,o.shopify_id,o.src,o.name,o.phone,o.area,o.addr,o.addr2||'',
