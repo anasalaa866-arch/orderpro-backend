@@ -851,7 +851,38 @@ app.post('/api/shopify/assign', async (req, res) => {
       }
     }
 
-    // Fallback: legacy fulfillment API (لما الـ app مش صاحب الـ fulfillment orders)
+    // Fallback 1: جرب الـ assigned fulfillment orders
+    if (!fulfilled) {
+      console.log('Trying assigned fulfillment orders...');
+      try {
+        const assignedR = await shopifyRequest(host, accessToken,
+          `/admin/api/2024-10/assigned_fulfillment_orders.json?assignment_status=fulfillment_requested`);
+        console.log('Assigned FOs status:', assignedR.status, JSON.stringify(assignedR.data).slice(0,300));
+        if (assignedR.status === 200 && assignedR.data.fulfillment_orders) {
+          const myFOs = assignedR.data.fulfillment_orders.filter(fo =>
+            String(fo.order_id) === String(shopifyOrderId)
+          );
+          console.log('My assigned FOs:', myFOs.length);
+          for (const fo of myFOs) {
+            const fulfillR = await shopifyRequest(host, accessToken,
+              `/admin/api/2024-10/fulfillments.json`, 'POST', {
+                fulfillment: {
+                  line_items_by_fulfillment_order: [{ fulfillment_order_id: fo.id }],
+                  notify_customer: false,
+                  tracking_company: courierName,
+                }
+              });
+            console.log('Assigned FO fulfill status:', fulfillR.status, JSON.stringify(fulfillR.data).slice(0,200));
+            if (fulfillR.status === 200 || fulfillR.status === 201) {
+              fulfilled = true;
+              errors.length = 0;
+            }
+          }
+        }
+      } catch(e3) { console.warn('Assigned FOs fallback:', e3.message); }
+    }
+
+    // Fallback 2: legacy fulfillment API
     if (!fulfilled) {
       console.log('Trying legacy fulfillment API...');
       try {
@@ -892,7 +923,42 @@ app.post('/api/shopify/assign', async (req, res) => {
       } catch(e2) { errors.push('Legacy fallback: ' + e2.message); }
     }
 
-  } catch (e) { errors.push('Fulfill: ' + e.message); }
+    // Fallback 3: محاولة نقل الـ FO لـ app الحالي ثم fulfill
+    if (!fulfilled) {
+      console.log('Trying fulfillment order move...');
+      try {
+        const foR2 = await shopifyRequest(host, accessToken,
+          `/admin/api/2024-10/orders/${shopifyOrderId}/fulfillment_orders.json`);
+        if (foR2.status === 200 && foR2.data.fulfillment_orders) {
+          for (const fo of foR2.data.fulfillment_orders) {
+            // جرب fulfill مباشرة بغض النظر عن الـ status
+            console.log('Force trying FO:', fo.id, 'status:', fo.status);
+            const fulfillR = await shopifyRequest(host, accessToken,
+              `/admin/api/2024-10/fulfillments.json`, 'POST', {
+                fulfillment: {
+                  line_items_by_fulfillment_order: [{ fulfillment_order_id: fo.id }],
+                  notify_customer: false,
+                  tracking_company: courierName,
+                }
+              });
+            console.log('Force fulfill status:', fulfillR.status, JSON.stringify(fulfillR.data).slice(0,300));
+            if (fulfillR.status === 200 || fulfillR.status === 201) {
+              fulfilled = true;
+              errors.length = 0;
+              break;
+            } else {
+              errors.push('Force HTTP ' + fulfillR.status + ': ' + JSON.stringify(fulfillR.data).slice(0,300));
+            }
+          }
+        }
+      } catch(e4) { errors.push('Move fallback: ' + e4.message); }
+    }
+
+    if (!fulfilled && errors.length === 0) {
+      errors.push('تعذّر عمل fulfill — الطلب ربما من channel مختلف لا يسمح بالـ fulfill من Admin API');
+    }
+
+  } catch (e) { errors.push('Fulfill error: ' + e.message); }
 
   console.log('shopify/assign result:', { success: errors.length === 0, errors });
   res.json({ success: errors.length === 0, errors, message: errors.length ? errors.join(' | ') : 'تم بنجاح' });
