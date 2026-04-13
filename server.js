@@ -172,6 +172,7 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS bosta_awb_base64 TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shop_settled BOOLEAN DEFAULT false",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS bosta_exported BOOLEAN DEFAULT false",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS line_items_json TEXT",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER",
     ];
@@ -221,6 +222,15 @@ function mapShopifyOrder(sh) {
     delivery_type: isTransitOrder ? 'transit' : isPickupOrder ? 'pickup' : isSameDay ? 'express' : 'normal',
     note: sh.note || '',
     items: (sh.line_items || []).map(i => i.name + ' x' + i.quantity).join(', '),
+    line_items_json: JSON.stringify((sh.line_items || []).map(i => ({
+      name: i.name,
+      title: i.title,
+      variantTitle: i.variant_title || '',
+      sku: i.sku || '',
+      quantity: i.quantity,
+      price: parseFloat(i.price) || 0,
+      totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
+    }))),
     province: (sh.shipping_address || {}).province_code || '',
     time: new Date(sh.created_at).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
     created_at: sh.created_at || new Date().toISOString(),
@@ -244,6 +254,7 @@ function rowToOrder(r) {
     bostaStatus: r.bosta_status, hasProblem: r.has_problem || false,
     assignedZone: r.assigned_zone || null,
     bostaExported: r.bosta_exported || false,
+    lineItemsJson: r.line_items_json || null,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -281,14 +292,15 @@ app.post('/webhook/shopify', async (req, res) => {
   try {
     if (DB_ENABLED) {
       await pool.query(`
-        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,addr2,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,time,created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,addr2,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,line_items_json,time,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
         ON CONFLICT (id) DO UPDATE SET
           name=EXCLUDED.name, phone=EXCLUDED.phone, area=EXCLUDED.area,
           addr=EXCLUDED.addr, addr2=EXCLUDED.addr2, total=EXCLUDED.total,
           paid=EXCLUDED.paid, shipping_method=EXCLUDED.shipping_method,
           delivery_type=EXCLUDED.delivery_type, note=EXCLUDED.note,
-          items=EXCLUDED.items, updated_at=NOW(),
+          items=EXCLUDED.items, line_items_json=EXCLUDED.line_items_json,
+          updated_at=NOW(),
           -- حدّث status بس لو الطلب ملغي على Shopify، أو لو لسه مش موزع
           status=CASE
             WHEN EXCLUDED.status='ملغي' THEN 'ملغي'
@@ -297,7 +309,7 @@ app.post('/webhook/shopify', async (req, res) => {
           END
       `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.addr2||'', o.total, o.ship,
           o.courier_id, o.status, o.paid, o.shipping_method, o.delivery_type,
-          o.note, o.items, o.time, o.created_at]);
+          o.note, o.items, o.line_items_json, o.time, o.created_at]);
     } else {
       const idx = memOrders.findIndex(x=>x.id===o.id);
       if (idx<0) memOrders.unshift({...o, shopifyId:o.shopify_id, courierId:null});
@@ -356,7 +368,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     bostaExported:'bosta_exported',
     name:'name', phone:'phone', area:'area', addr:'addr',
     province:'province',
-    items:'items', total:'total',
+    items:'items', total:'total', lineItemsJson:'line_items_json',
   };
   Object.entries(b).forEach(([k, v]) => {
     if (map[k]) { sets.push(`${map[k]}=$${vals.length+1}`); vals.push(v); }
@@ -1064,17 +1076,22 @@ app.post('/webhook/shopify/update', async (req, res) => {
     const newTotal = parseFloat(sh.total_price) || row.total;
     const newPaid = sh.financial_status === 'paid' || sh.financial_status === 'partially_paid';
     const newItems = (sh.line_items || []).map(i => i.name + ' x' + i.quantity).join(', ') || row.items;
+    const newLineItemsJson = sh.line_items ? JSON.stringify((sh.line_items || []).map(i => ({
+      name: i.name, title: i.title, variantTitle: i.variant_title || '',
+      sku: i.sku || '', quantity: i.quantity,
+      price: parseFloat(i.price) || 0,
+      totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
+    }))) : row.line_items_json;
     const newNote = sh.note || row.note;
 
-    // حدّث بس لو الطلب مش موزع بعد
-    // لو موزع، حدّث البيانات الشخصية بس (اسم، هاتف، عنوان، مبلغ، منتجات)
     await pool.query(`
       UPDATE orders SET
         name=$1, phone=$2, area=$3, addr=$4,
         total=$5, paid=$6, items=$7, note=$8,
+        line_items_json=$9,
         updated_at=NOW()
-      WHERE id=$9`,
-      [newName, newPhone, newArea, newAddr, newTotal, newPaid, newItems, newNote, orderId]
+      WHERE id=$10`,
+      [newName, newPhone, newArea, newAddr, newTotal, newPaid, newItems, newNote, newLineItemsJson, orderId]
     );
 
     console.log('Order updated via webhook:', orderId, {name:newName, total:newTotal});
