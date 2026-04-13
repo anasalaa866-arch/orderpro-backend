@@ -757,6 +757,24 @@ async function fetchShopifyOrders(shopUrl, accessToken, sinceDate) {
   return allOrders;
 }
 
+// ===== SHOPIFY DIAGNOSE =====
+app.post('/api/shopify/diagnose', async (req, res) => {
+  const { shopUrl, accessToken, shopifyOrderId } = req.body;
+  if (!shopUrl || !accessToken || !shopifyOrderId)
+    return res.status(400).json({ error: 'بيانات ناقصة' });
+  const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  try {
+    const orderR = await shopifyRequest(host, accessToken,
+      `/admin/api/2024-01/orders/${shopifyOrderId}.json?fields=id,name,fulfillment_status,tags,financial_status`);
+    const foR = await shopifyRequest(host, accessToken,
+      `/admin/api/2024-01/orders/${shopifyOrderId}/fulfillment_orders.json`);
+    res.json({
+      order: orderR.status === 200 ? orderR.data.order : { error: orderR.status, data: orderR.data },
+      fulfillmentOrders: foR.status === 200 ? foR.data.fulfillment_orders : { error: foR.status, data: foR.data },
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ===== SHOPIFY ASSIGN: Fulfill + Tag =====
 app.post('/api/shopify/assign', async (req, res) => {
   const { shopUrl, accessToken, shopifyOrderId, courierName, orderId } = req.body;
