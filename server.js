@@ -173,6 +173,7 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shop_settled BOOLEAN DEFAULT false",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS bosta_exported BOOLEAN DEFAULT false",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS line_items_json TEXT",
+      "ALTER TABLE settlements ADD COLUMN IF NOT EXISTS adj TEXT DEFAULT '[]'",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER",
     ];
@@ -958,7 +959,9 @@ app.get('/api/settlements/:courierId', async (req, res) => {
       orderIds: JSON.parse(s.order_ids||'[]'),
       cod: parseFloat(s.cod)||0,
       ship: parseFloat(s.ship)||0,
-      notes: s.notes||''
+      notes: s.notes||'',
+      adj: JSON.parse(s.adj||'[]'),
+      adjTotal: JSON.parse(s.adj||'[]').reduce((sum,a)=>sum+(a.amount||0),0),
     }))});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -975,23 +978,25 @@ app.get('/api/settlements', async (req, res) => {
       orderIds: JSON.parse(s.order_ids||'[]'),
       cod: parseFloat(s.cod)||0,
       ship: parseFloat(s.ship)||0,
-      notes: s.notes||''
+      notes: s.notes||'',
+      adj: JSON.parse(s.adj||'[]'),
+      adjTotal: JSON.parse(s.adj||'[]').reduce((sum,a)=>sum+(a.amount||0),0),
     }))});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
 // إضافة تسوية جديدة
 app.post('/api/settlements', async (req, res) => {
-  const {courierId, ts, orderIds, cod, ship, notes} = req.body;
+  const {courierId, ts, orderIds, cod, ship, notes, adj} = req.body;
   if(!courierId) return res.status(400).json({error:'courierId required'});
   if(!DB_ENABLED) return res.json({success:true, id:Date.now()});
   try{
     const r = await pool.query(
-      `INSERT INTO settlements(courier_id, ts, order_ids, cod, ship, notes)
-       VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+      `INSERT INTO settlements(courier_id, ts, order_ids, cod, ship, notes, adj)
+       VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
       [courierId, ts||new Date().toISOString(),
        JSON.stringify(orderIds||[]),
-       cod||0, ship||0, notes||'']
+       cod||0, ship||0, notes||'', JSON.stringify(adj||[])]
     );
     // حدّث settled في couriers
     await pool.query(
