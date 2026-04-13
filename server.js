@@ -819,43 +819,78 @@ app.post('/api/shopify/assign', async (req, res) => {
       `/admin/api/2024-10/orders/${shopifyOrderId}/fulfillment_orders.json`);
     console.log('Fulfillment orders status:', foR.status, 'count:', foR.data.fulfillment_orders?.length);
 
-    if (foR.status === 200 && foR.data.fulfillment_orders) {
+    let fulfilled = false;
+
+    if (foR.status === 200 && foR.data.fulfillment_orders && foR.data.fulfillment_orders.length > 0) {
       const pendingFOs = foR.data.fulfillment_orders.filter(fo =>
         fo.status === 'open' || fo.status === 'in_progress'
       );
       console.log('Pending fulfillment orders:', pendingFOs.length, pendingFOs.map(f=>f.status));
 
-      if(!pendingFOs.length){
-        // الطلب مفيش fulfillment orders قابلة — ممكن يكون fulfilled بالفعل
-        const allStatuses = foR.data.fulfillment_orders.map(f=>f.status).join(', ');
-        console.log('All FO statuses:', allStatuses);
-        if(foR.data.fulfillment_orders.every(fo=>fo.status==='closed'||fo.status==='fulfilled')){
-          console.log('Order already fulfilled — skipping');
-          // مش error — الطلب fulfilled بالفعل
+      for (const fo of pendingFOs) {
+        const fulfillR = await shopifyRequest(host, accessToken,
+          `/admin/api/2024-10/fulfillments.json`, 'POST', {
+            fulfillment: {
+              line_items_by_fulfillment_order: [{ fulfillment_order_id: fo.id }],
+              notify_customer: false,
+              tracking_company: courierName,
+            }
+          });
+        console.log('Fulfill (new API) status:', fulfillR.status, JSON.stringify(fulfillR.data).slice(0,200));
+        if (fulfillR.status === 200 || fulfillR.status === 201) {
+          fulfilled = true;
         } else {
-          errors.push('لا توجد fulfillment orders مفتوحة (statuses: ' + allStatuses + ')');
-        }
-      } else {
-        for (const fo of pendingFOs) {
-          const fulfillR = await shopifyRequest(host, accessToken,
-            `/admin/api/2024-10/fulfillments.json`, 'POST', {
-              fulfillment: {
-                line_items_by_fulfillment_order: [
-                  { fulfillment_order_id: fo.id }
-                ],
-                notify_customer: false,
-                tracking_company: courierName,
-              }
-            });
-          console.log('Fulfill status:', fulfillR.status, JSON.stringify(fulfillR.data).slice(0,200));
-          if (fulfillR.status !== 200 && fulfillR.status !== 201) {
-            errors.push('Fulfill HTTP ' + fulfillR.status + ': ' + JSON.stringify(fulfillR.data).slice(0,200));
-          }
+          errors.push('Fulfill HTTP ' + fulfillR.status + ': ' + JSON.stringify(fulfillR.data).slice(0,200));
         }
       }
-    } else {
-      errors.push('FulfillmentOrders HTTP ' + foR.status + ': ' + JSON.stringify(foR.data).slice(0,150));
+      if(pendingFOs.length === 0){
+        const allClosed = foR.data.fulfillment_orders.every(fo=>fo.status==='closed'||fo.status==='fulfilled');
+        if(allClosed){ console.log('Already fulfilled'); fulfilled = true; }
+        else { errors.push('No open FOs. Statuses: ' + foR.data.fulfillment_orders.map(f=>f.status).join(', ')); }
+      }
     }
+
+    // Fallback: legacy fulfillment API (لما الـ app مش صاحب الـ fulfillment orders)
+    if (!fulfilled) {
+      console.log('Trying legacy fulfillment API...');
+      try {
+        // جيب الـ line items
+        const orderR2 = await shopifyRequest(host, accessToken,
+          `/admin/api/2024-10/orders/${shopifyOrderId}.json?fields=id,line_items,fulfillment_status`);
+        if (orderR2.status === 200 && orderR2.data.order) {
+          const order2 = orderR2.data.order;
+          if (order2.fulfillment_status === 'fulfilled') {
+            console.log('Already fulfilled (legacy check)');
+            fulfilled = true;
+          } else {
+            const lineItems = (order2.line_items || []).map(li => ({
+              id: li.id, quantity: li.fulfillable_quantity || li.quantity
+            })).filter(li => li.quantity > 0);
+
+            if (lineItems.length > 0) {
+              const legacyR = await shopifyRequest(host, accessToken,
+                `/admin/api/2024-10/orders/${shopifyOrderId}/fulfillments.json`, 'POST', {
+                  fulfillment: {
+                    line_items: lineItems,
+                    notify_customer: false,
+                    tracking_company: courierName,
+                  }
+                });
+              console.log('Legacy fulfill status:', legacyR.status, JSON.stringify(legacyR.data).slice(0,200));
+              if (legacyR.status === 200 || legacyR.status === 201) {
+                fulfilled = true;
+                errors.length = 0; // مسح الـ errors السابقة
+              } else {
+                errors.push('Legacy Fulfill HTTP ' + legacyR.status + ': ' + JSON.stringify(legacyR.data).slice(0,200));
+              }
+            } else {
+              errors.push('No fulfillable line items found');
+            }
+          }
+        }
+      } catch(e2) { errors.push('Legacy fallback: ' + e2.message); }
+    }
+
   } catch (e) { errors.push('Fulfill: ' + e.message); }
 
   console.log('shopify/assign result:', { success: errors.length === 0, errors });
