@@ -231,6 +231,7 @@ function mapShopifyOrder(sh) {
       quantity: i.quantity,
       price: parseFloat(i.price) || 0,
       totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
+      image: (i.image && i.image.src) ? i.image.src : null,
     }))),
     province: (sh.shipping_address || {}).province_code || '',
     time: new Date(sh.created_at).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
@@ -1161,6 +1162,7 @@ app.post('/webhook/shopify/update', async (req, res) => {
       sku: i.sku || '', quantity: i.quantity,
       price: parseFloat(i.price) || 0,
       totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
+      image: (i.image && i.image.src) ? i.image.src : null,
     }))) : row.line_items_json;
     const newNote = sh.note || row.note;
 
