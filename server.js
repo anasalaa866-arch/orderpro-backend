@@ -760,6 +760,8 @@ async function fetchShopifyOrders(shopUrl, accessToken, sinceDate) {
 // ===== SHOPIFY ASSIGN: Fulfill + Tag =====
 app.post('/api/shopify/assign', async (req, res) => {
   const { shopUrl, accessToken, shopifyOrderId, courierName, orderId } = req.body;
+  console.log('shopify/assign called:', { shopUrl: shopUrl?.slice(0,30), shopifyOrderId, courierName, orderId });
+
   if (!shopUrl || !accessToken || !shopifyOrderId) {
     return res.status(400).json({ success: false, error: 'بيانات ناقصة' });
   }
@@ -769,56 +771,60 @@ app.post('/api/shopify/assign', async (req, res) => {
 
   // 1. إضافة Tag باسم المندوب
   try {
-    // جيب الـ tags الحالية
     const getR = await shopifyRequest(host, accessToken, `/admin/api/2024-01/orders/${shopifyOrderId}.json?fields=id,tags`);
+    console.log('Get order tags status:', getR.status);
     if (getR.status === 200 && getR.data.order) {
       const currentTags = getR.data.order.tags || '';
       const newTags = currentTags
         ? currentTags.split(',').map(t=>t.trim()).filter(t=>t).concat(courierName).join(', ')
         : courierName;
-      
-      await shopifyRequest(host, accessToken, `/admin/api/2024-01/orders/${shopifyOrderId}.json`, 'PUT',
+      const tagR = await shopifyRequest(host, accessToken, `/admin/api/2024-01/orders/${shopifyOrderId}.json`, 'PUT',
         { order: { id: shopifyOrderId, tags: newTags } });
+      console.log('Update tags status:', tagR.status);
+      if(tagR.status !== 200) errors.push('Tag HTTP ' + tagR.status + ': ' + JSON.stringify(tagR.data).slice(0,120));
+    } else {
+      errors.push('Get tags HTTP ' + getR.status + ': ' + JSON.stringify(getR.data).slice(0,120));
     }
   } catch (e) { errors.push('Tag: ' + e.message); }
 
   // 2. Fulfill الطلب
   try {
-    // جيب الـ fulfillment orders
     const foR = await shopifyRequest(host, accessToken,
       `/admin/api/2024-01/orders/${shopifyOrderId}/fulfillment_orders.json`);
-    
+    console.log('Fulfillment orders status:', foR.status, 'count:', foR.data.fulfillment_orders?.length);
+
     if (foR.status === 200 && foR.data.fulfillment_orders) {
       const pendingFOs = foR.data.fulfillment_orders.filter(fo =>
         fo.status === 'open' || fo.status === 'in_progress'
       );
-      
+      console.log('Pending fulfillment orders:', pendingFOs.length);
+
+      if(!pendingFOs.length){
+        errors.push('لا توجد fulfillment orders قابلة للإتمام — ربما الطلب fulfilled بالفعل أو pickup');
+      }
+
       for (const fo of pendingFOs) {
-        const lineItems = fo.line_items.map(li => ({
-          fulfillment_order_id: fo.id,
-          fulfillment_order_line_item_id: li.id,
-          quantity: li.fulfillable_quantity,
-        }));
-        
-        if (lineItems.some(li => li.quantity > 0)) {
-          const fulfillR = await shopifyRequest(host, accessToken,
-            `/admin/api/2024-01/fulfillments.json`, 'POST', {
-              fulfillment: {
-                line_items_by_fulfillment_order: [
-                  { fulfillment_order_id: fo.id }
-                ],
-                notify_customer: false,
-                tracking_company: courierName,
-              }
-            });
-          if (fulfillR.status !== 200 && fulfillR.status !== 201) {
-            errors.push('Fulfill HTTP ' + fulfillR.status + ': ' + JSON.stringify(fulfillR.data).slice(0,100));
-          }
+        const fulfillR = await shopifyRequest(host, accessToken,
+          `/admin/api/2024-01/fulfillments.json`, 'POST', {
+            fulfillment: {
+              line_items_by_fulfillment_order: [
+                { fulfillment_order_id: fo.id }
+              ],
+              notify_customer: false,
+              tracking_company: courierName,
+            }
+          });
+        console.log('Fulfill status:', fulfillR.status, JSON.stringify(fulfillR.data).slice(0,150));
+        if (fulfillR.status !== 200 && fulfillR.status !== 201) {
+          errors.push('Fulfill HTTP ' + fulfillR.status + ': ' + JSON.stringify(fulfillR.data).slice(0,150));
         }
       }
+    } else {
+      errors.push('FulfillmentOrders HTTP ' + foR.status + ': ' + JSON.stringify(foR.data).slice(0,120));
     }
   } catch (e) { errors.push('Fulfill: ' + e.message); }
 
+  console.log('shopify/assign result:', { success: errors.length === 0, errors });
   res.json({ success: errors.length === 0, errors, message: errors.length ? errors.join(' | ') : 'تم بنجاح' });
 });
 
