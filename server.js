@@ -746,7 +746,7 @@ function fetchPage(host, accessToken, path) {
 
 async function fetchShopifyOrders(shopUrl, accessToken, sinceDate) {
   const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
-  let path = `/admin/api/2024-01/orders.json?status=any&created_at_min=${encodeURIComponent(sinceDate)}&limit=250&order=created_at+desc`;
+  let path = `/admin/api/2024-10/orders.json?status=any&created_at_min=${encodeURIComponent(sinceDate)}&limit=250&order=created_at+desc`;
   let allOrders = [], pageNum = 1;
   while (path) {
     const { orders, nextUrl } = await fetchPage(host, accessToken, path);
@@ -765,12 +765,17 @@ app.post('/api/shopify/diagnose', async (req, res) => {
   const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
   try {
     const orderR = await shopifyRequest(host, accessToken,
-      `/admin/api/2024-01/orders/${shopifyOrderId}.json?fields=id,name,fulfillment_status,tags,financial_status`);
+      `/admin/api/2024-10/orders/${shopifyOrderId}.json?fields=id,name,order_number,fulfillment_status,tags,financial_status`);
     const foR = await shopifyRequest(host, accessToken,
-      `/admin/api/2024-01/orders/${shopifyOrderId}/fulfillment_orders.json`);
+      `/admin/api/2024-10/orders/${shopifyOrderId}/fulfillment_orders.json`);
+    console.log('DIAGNOSE order:', JSON.stringify(orderR.data).slice(0,300));
+    console.log('DIAGNOSE FOs:', JSON.stringify(foR.data).slice(0,500));
     res.json({
-      order: orderR.status === 200 ? orderR.data.order : { error: orderR.status, data: orderR.data },
-      fulfillmentOrders: foR.status === 200 ? foR.data.fulfillment_orders : { error: foR.status, data: foR.data },
+      shopifyOrderId,
+      orderStatus: orderR.status,
+      order: orderR.status === 200 ? orderR.data.order : { error: orderR.status, raw: JSON.stringify(orderR.data).slice(0,300) },
+      foStatus: foR.status,
+      fulfillmentOrders: foR.status === 200 ? foR.data.fulfillment_orders : { error: foR.status, raw: JSON.stringify(foR.data).slice(0,300) },
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -789,14 +794,14 @@ app.post('/api/shopify/assign', async (req, res) => {
 
   // 1. إضافة Tag باسم المندوب (اختياري — مش بيوقف الـ fulfill لو فشل)
   try {
-    const getR = await shopifyRequest(host, accessToken, `/admin/api/2024-01/orders/${shopifyOrderId}.json?fields=id,tags`);
+    const getR = await shopifyRequest(host, accessToken, `/admin/api/2024-10/orders/${shopifyOrderId}.json?fields=id,tags`);
     console.log('Get order tags status:', getR.status);
     if (getR.status === 200 && getR.data.order) {
       const currentTags = getR.data.order.tags || '';
       const newTags = currentTags
         ? currentTags.split(',').map(t=>t.trim()).filter(t=>t).concat(courierName).join(', ')
         : courierName;
-      const tagR = await shopifyRequest(host, accessToken, `/admin/api/2024-01/orders/${shopifyOrderId}.json`, 'PUT',
+      const tagR = await shopifyRequest(host, accessToken, `/admin/api/2024-10/orders/${shopifyOrderId}.json`, 'PUT',
         { order: { id: shopifyOrderId, tags: newTags } });
       console.log('Update tags status:', tagR.status);
       if(tagR.status === 403){
@@ -811,7 +816,7 @@ app.post('/api/shopify/assign', async (req, res) => {
   // 2. Fulfill الطلب
   try {
     const foR = await shopifyRequest(host, accessToken,
-      `/admin/api/2024-01/orders/${shopifyOrderId}/fulfillment_orders.json`);
+      `/admin/api/2024-10/orders/${shopifyOrderId}/fulfillment_orders.json`);
     console.log('Fulfillment orders status:', foR.status, 'count:', foR.data.fulfillment_orders?.length);
 
     if (foR.status === 200 && foR.data.fulfillment_orders) {
@@ -833,7 +838,7 @@ app.post('/api/shopify/assign', async (req, res) => {
       } else {
         for (const fo of pendingFOs) {
           const fulfillR = await shopifyRequest(host, accessToken,
-            `/admin/api/2024-01/fulfillments.json`, 'POST', {
+            `/admin/api/2024-10/fulfillments.json`, 'POST', {
               fulfillment: {
                 line_items_by_fulfillment_order: [
                   { fulfillment_order_id: fo.id }
