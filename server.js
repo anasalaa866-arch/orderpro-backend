@@ -839,11 +839,13 @@ app.get('/api/check-books', async (req, res) => {
 });
 
 app.post('/api/check-books', async (req, res) => {
-  const { id, name, bank, account, pages, note } = req.body;
+  const { id, name, bank, account, pages, note, firstNum } = req.body;
   if (!DB_ENABLED) return res.json({ book: req.body });
+  // إضافة first_num column لو مش موجودة
+  try{ await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1"); }catch(e){}
   await pool.query(
-    'INSERT INTO check_books (id,name,bank,account,pages,note) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6',
-    [id, name, bank||'', account||'', pages||48, note||'']
+    'INSERT INTO check_books (id,name,bank,account,pages,note,first_num) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6,first_num=$7',
+    [id, name, bank||'', account||'', pages||48, note||'', firstNum||1]
   );
   res.json({ book: req.body });
 });
@@ -1182,3 +1184,145 @@ initDB().then(() => {
 } else {
   app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT, '(بدون DB)'));
 }
+
+// ===== TREASURY =====
+async function initTreasuryTables(client) {
+  await client.query(`CREATE TABLE IF NOT EXISTS treasuries (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    opening NUMERIC DEFAULT 0,
+    note TEXT DEFAULT ''
+  )`);
+  await client.query(`CREATE TABLE IF NOT EXISTS treasury_tx (
+    id TEXT PRIMARY KEY,
+    treasury_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    amount NUMERIC NOT NULL,
+    reason TEXT NOT NULL,
+    date TEXT NOT NULL
+  )`);
+}
+
+// GET all treasuries
+app.get('/api/treasuries', async (req, res) => {
+  if(!DB_ENABLED) return res.json({treasuries:[]});
+  try {
+    const client = await pool.connect();
+    await initTreasuryTables(client);
+    const r = await client.query('SELECT * FROM treasuries ORDER BY name');
+    client.release();
+    res.json({treasuries: r.rows});
+  } catch(e) { res.json({treasuries:[]}); }
+});
+
+// POST treasury
+app.post('/api/treasuries', async (req, res) => {
+  if(!DB_ENABLED) return res.json({ok:true});
+  const {id, name, opening, note} = req.body;
+  try {
+    const client = await pool.connect();
+    await initTreasuryTables(client);
+    await client.query(
+      'INSERT INTO treasuries (id,name,opening,note) VALUES ($1,$2,$3,$4) ON CONFLICT (id) DO UPDATE SET name=$2,opening=$3,note=$4',
+      [id, name, opening||0, note||'']
+    );
+    client.release();
+    res.json({ok:true});
+  } catch(e) { res.json({ok:false, error:e.message}); }
+});
+
+// DELETE treasury
+app.delete('/api/treasuries/:id', async (req, res) => {
+  if(!DB_ENABLED) return res.json({ok:true});
+  try {
+    const client = await pool.connect();
+    await client.query('DELETE FROM treasuries WHERE id=$1', [req.params.id]);
+    await client.query('DELETE FROM treasury_tx WHERE treasury_id=$1', [req.params.id]);
+    client.release();
+    res.json({ok:true});
+  } catch(e) { res.json({ok:false}); }
+});
+
+// GET transactions
+app.get('/api/treasury-tx', async (req, res) => {
+  if(!DB_ENABLED) return res.json({transactions:[]});
+  try {
+    const client = await pool.connect();
+    await initTreasuryTables(client);
+    const r = await client.query('SELECT * FROM treasury_tx ORDER BY date DESC, id DESC');
+    client.release();
+    res.json({transactions: r.rows.map(x=>({
+      id: x.id, treasuryId: x.treasury_id, type: x.type,
+      amount: parseFloat(x.amount), reason: x.reason, date: x.date
+    }))});
+  } catch(e) { res.json({transactions:[]}); }
+});
+
+// POST transaction
+app.post('/api/treasury-tx', async (req, res) => {
+  if(!DB_ENABLED) return res.json({ok:true});
+  const {id, treasuryId, type, amount, reason, date} = req.body;
+  try {
+    const client = await pool.connect();
+    await initTreasuryTables(client);
+    await client.query(
+      'INSERT INTO treasury_tx (id,treasury_id,type,amount,reason,date) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET type=$3,amount=$4,reason=$5,date=$6',
+      [id, treasuryId, type, amount, reason, date]
+    );
+    client.release();
+    res.json({ok:true});
+  } catch(e) { res.json({ok:false, error:e.message}); }
+});
+
+// DELETE transaction
+app.delete('/api/treasury-tx/:id', async (req, res) => {
+  if(!DB_ENABLED) return res.json({ok:true});
+  try {
+    const client = await pool.connect();
+    await client.query('DELETE FROM treasury_tx WHERE id=$1', [req.params.id]);
+    client.release();
+    res.json({ok:true});
+  } catch(e) { res.json({ok:false}); }
+});
+
+// PATCH transaction (edit)
+app.patch('/api/treasury-tx/:id', async (req, res) => {
+  if(!DB_ENABLED) return res.json({ok:true});
+  const {amount, reason, date, type} = req.body;
+  try {
+    const client = await pool.connect();
+    await client.query(
+      'UPDATE treasury_tx SET amount=$1,reason=$2,date=$3,type=$4 WHERE id=$5',
+      [amount, reason, date, type, req.params.id]
+    );
+    client.release();
+    res.json({ok:true});
+  } catch(e) { res.json({ok:false}); }
+});
+// Check Suppliers
+app.get('/api/check-suppliers', async (req, res) => {
+  if(!DB_ENABLED) return res.json({suppliers:[]});
+  try{
+    await pool.query("CREATE TABLE IF NOT EXISTS check_suppliers (id TEXT PRIMARY KEY, name TEXT)");
+    const r = await pool.query('SELECT * FROM check_suppliers ORDER BY name');
+    res.json({suppliers: r.rows});
+  }catch(e){ res.json({suppliers:[]}); }
+});
+
+app.post('/api/check-suppliers', async (req, res) => {
+  if(!DB_ENABLED) return res.json({ok:true});
+  const {id, name} = req.body;
+  try{
+    await pool.query("CREATE TABLE IF NOT EXISTS check_suppliers (id TEXT PRIMARY KEY, name TEXT)");
+    await pool.query('INSERT INTO check_suppliers (id,name) VALUES ($1,$2) ON CONFLICT (id) DO UPDATE SET name=$2', [id, name]);
+    res.json({ok:true});
+  }catch(e){ res.json({ok:false}); }
+});
+
+app.delete('/api/check-suppliers/:id', async (req, res) => {
+  if(!DB_ENABLED) return res.json({ok:true});
+  try{
+    await pool.query('DELETE FROM check_suppliers WHERE id=$1', [req.params.id]);
+    res.json({ok:true});
+  }catch(e){ res.json({ok:false}); }
+});
