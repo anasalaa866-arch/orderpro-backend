@@ -765,7 +765,7 @@ app.post('/api/shopify/diagnose', async (req, res) => {
   const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
   try {
     const orderR = await shopifyRequest(host, accessToken,
-      `/admin/api/2024-10/orders/${shopifyOrderId}.json?fields=id,name,order_number,fulfillment_status,tags,financial_status`);
+      `/admin/api/2024-10/orders/${shopifyOrderId}.json?fields=id,name,order_number,fulfillment_status,tags,financial_status,source_name,line_items,fulfillments`);
     const foR = await shopifyRequest(host, accessToken,
       `/admin/api/2024-10/orders/${shopifyOrderId}/fulfillment_orders.json`);
     console.log('DIAGNOSE order:', JSON.stringify(orderR.data).slice(0,300));
