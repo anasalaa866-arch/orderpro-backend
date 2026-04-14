@@ -173,6 +173,8 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shop_settled BOOLEAN DEFAULT false",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS bosta_exported BOOLEAN DEFAULT false",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS line_items_json TEXT",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subtotal_price NUMERIC DEFAULT 0",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_price NUMERIC DEFAULT 0",
       "ALTER TABLE settlements ADD COLUMN IF NOT EXISTS adj TEXT DEFAULT '[]'",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER",
@@ -215,6 +217,8 @@ function mapShopifyOrder(sh) {
     addr: [shipping.address1, shipping.address2, shipping.city].filter(Boolean).join('، ') || '—',
     addr2: shipping.address2 || '',
     total: parseFloat(sh.total_price) || 0,
+    subtotal_price: parseFloat(sh.subtotal_price) || 0,
+    shipping_price: (sh.shipping_lines || []).reduce((s, l) => s + (parseFloat(l.price) || 0), 0),
     ship: 50,
     courier_id: null,
     status,
@@ -257,6 +261,8 @@ function rowToOrder(r) {
     assignedZone: r.assigned_zone || null,
     bostaExported: r.bosta_exported || false,
     lineItemsJson: r.line_items_json || null,
+    subtotalPrice: parseFloat(r.subtotal_price) || 0,
+    shippingPrice: parseFloat(r.shipping_price) || 0,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -294,11 +300,12 @@ app.post('/webhook/shopify', async (req, res) => {
   try {
     if (DB_ENABLED) {
       await pool.query(`
-        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,addr2,total,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,line_items_json,time,created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,addr2,total,subtotal_price,shipping_price,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,line_items_json,time,created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
         ON CONFLICT (id) DO UPDATE SET
           name=EXCLUDED.name, phone=EXCLUDED.phone, area=EXCLUDED.area,
           addr=EXCLUDED.addr, addr2=EXCLUDED.addr2, total=EXCLUDED.total,
+          subtotal_price=EXCLUDED.subtotal_price, shipping_price=EXCLUDED.shipping_price,
           paid=EXCLUDED.paid, shipping_method=EXCLUDED.shipping_method,
           delivery_type=EXCLUDED.delivery_type, note=EXCLUDED.note,
           items=EXCLUDED.items, line_items_json=EXCLUDED.line_items_json,
@@ -309,7 +316,8 @@ app.post('/webhook/shopify', async (req, res) => {
             WHEN orders.status IN ('جاري التوصيل','مكتمل','ملغي') THEN orders.status
             ELSE EXCLUDED.status
           END
-      `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.addr2||'', o.total, o.ship,
+      `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.addr2||'', o.total,
+          o.subtotal_price||0, o.shipping_price||0, o.ship,
           o.courier_id, o.status, o.paid, o.shipping_method, o.delivery_type,
           o.note, o.items, o.line_items_json, o.time, o.created_at]);
     } else {
