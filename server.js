@@ -767,6 +767,42 @@ async function fetchShopifyOrders(shopUrl, accessToken, sinceDate) {
 }
 
 // ===== SHOPIFY DIAGNOSE =====
+// جيب line items مع الصور لطلب معين وحدّث الـ DB
+app.post('/api/shopify/fetch-line-items', async (req, res) => {
+  const { shopUrl, accessToken, shopifyOrderId, orderId } = req.body;
+  if (!shopUrl || !accessToken || !shopifyOrderId)
+    return res.status(400).json({ error: 'بيانات ناقصة' });
+  const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  try {
+    const r = await shopifyRequest(host, accessToken,
+      `/admin/api/2024-10/orders/${shopifyOrderId}.json?fields=id,line_items,subtotal_price,total_price,shipping_lines`);
+    if (r.status !== 200) return res.status(r.status).json({ error: r.data });
+
+    const sh = r.data.order;
+    const lineItemsJson = JSON.stringify((sh.line_items || []).map(i => ({
+      name: i.name,
+      title: i.title,
+      variantTitle: i.variant_title || '',
+      sku: i.sku || '',
+      quantity: i.quantity,
+      price: parseFloat(i.price) || 0,
+      totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
+      image: (i.image && i.image.src) ? i.image.src : null,
+    })));
+    const subtotalPrice = parseFloat(sh.subtotal_price) || 0;
+    const shippingPrice = (sh.shipping_lines || []).reduce((s, l) => s + (parseFloat(l.price) || 0), 0);
+
+    // حدّث الـ DB
+    if (DB_ENABLED && orderId) {
+      await pool.query(
+        'UPDATE orders SET line_items_json=$1, subtotal_price=$2, shipping_price=$3, updated_at=NOW() WHERE id=$4',
+        [lineItemsJson, subtotalPrice, shippingPrice, orderId]
+      );
+    }
+    res.json({ success: true, lineItemsJson, subtotalPrice, shippingPrice });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/shopify/diagnose', async (req, res) => {
   const { shopUrl, accessToken, shopifyOrderId } = req.body;
   if (!shopUrl || !accessToken || !shopifyOrderId)
