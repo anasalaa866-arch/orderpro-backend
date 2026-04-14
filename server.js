@@ -896,6 +896,7 @@ app.post('/api/shopify/assign', async (req, res) => {
     }
 
     // Fallback 2: جرب الـ assigned fulfillment orders (requested)
+    if (!fulfilled) {
       try {
         const assignedR = await shopifyRequest(host, accessToken,
           `/admin/api/2024-10/assigned_fulfillment_orders.json?assignment_status=fulfillment_requested`);
