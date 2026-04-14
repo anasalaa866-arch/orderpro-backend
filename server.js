@@ -176,6 +176,7 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS subtotal_price NUMERIC DEFAULT 0",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_price NUMERIC DEFAULT 0",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS source_name TEXT DEFAULT ''",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS batch_code TEXT DEFAULT ''",
       "ALTER TABLE settlements ADD COLUMN IF NOT EXISTS adj TEXT DEFAULT '[]'",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER",
@@ -266,6 +267,7 @@ function rowToOrder(r) {
     subtotalPrice: parseFloat(r.subtotal_price) || 0,
     shippingPrice: parseFloat(r.shipping_price) || 0,
     sourceName: r.source_name || '',
+    batchCode: r.batch_code || '',
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -383,6 +385,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     name:'name', phone:'phone', area:'area', addr:'addr',
     province:'province',
     items:'items', total:'total', lineItemsJson:'line_items_json',
+    batchCode:'batch_code', sourceName:'source_name',
   };
   Object.entries(b).forEach(([k, v]) => {
     if (map[k]) { sets.push(`${map[k]}=$${vals.length+1}`); vals.push(v); }
