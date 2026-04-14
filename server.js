@@ -769,14 +769,27 @@ app.post('/api/shopify/diagnose', async (req, res) => {
       `/admin/api/2024-10/orders/${shopifyOrderId}.json?fields=id,name,order_number,fulfillment_status,tags,financial_status,source_name,line_items,fulfillments`);
     const foR = await shopifyRequest(host, accessToken,
       `/admin/api/2024-10/orders/${shopifyOrderId}/fulfillment_orders.json`);
+    const assignedR = await shopifyRequest(host, accessToken,
+      `/admin/api/2024-10/assigned_fulfillment_orders.json?assignment_status=fulfillment_unsubmitted`);
+    const assignedR2 = await shopifyRequest(host, accessToken,
+      `/admin/api/2024-10/assigned_fulfillment_orders.json?assignment_status=fulfillment_requested`);
     console.log('DIAGNOSE order:', JSON.stringify(orderR.data).slice(0,300));
     console.log('DIAGNOSE FOs:', JSON.stringify(foR.data).slice(0,500));
+    console.log('DIAGNOSE assigned unsubmitted:', JSON.stringify(assignedR.data).slice(0,500));
+    console.log('DIAGNOSE assigned requested:', JSON.stringify(assignedR2.data).slice(0,500));
+    const assignedForOrder = [
+      ...((assignedR.data.fulfillment_orders||[]).filter(fo=>String(fo.order_id)===String(shopifyOrderId))),
+      ...((assignedR2.data.fulfillment_orders||[]).filter(fo=>String(fo.order_id)===String(shopifyOrderId))),
+    ];
     res.json({
       shopifyOrderId,
       orderStatus: orderR.status,
       order: orderR.status === 200 ? orderR.data.order : { error: orderR.status, raw: JSON.stringify(orderR.data).slice(0,300) },
       foStatus: foR.status,
       fulfillmentOrders: foR.status === 200 ? foR.data.fulfillment_orders : { error: foR.status, raw: JSON.stringify(foR.data).slice(0,300) },
+      assignedFOs: assignedForOrder,
+      assignedUnsubmittedCount: (assignedR.data.fulfillment_orders||[]).length,
+      assignedRequestedCount: (assignedR2.data.fulfillment_orders||[]).length,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -851,9 +864,38 @@ app.post('/api/shopify/assign', async (req, res) => {
       }
     }
 
-    // Fallback 1: جرب الـ assigned fulfillment orders
+    // Fallback 1: جرب merchant managed fulfillment orders
     if (!fulfilled) {
-      console.log('Trying assigned fulfillment orders...');
+      console.log('Trying merchant managed fulfillment orders...');
+      try {
+        const mmR = await shopifyRequest(host, accessToken,
+          `/admin/api/2024-10/assigned_fulfillment_orders.json?assignment_status=fulfillment_unsubmitted`);
+        console.log('MM FOs status:', mmR.status, JSON.stringify(mmR.data).slice(0,400));
+        if (mmR.status === 200 && mmR.data.fulfillment_orders) {
+          const myFOs = mmR.data.fulfillment_orders.filter(fo =>
+            String(fo.order_id) === String(shopifyOrderId)
+          );
+          console.log('MM FOs for this order:', myFOs.length);
+          for (const fo of myFOs) {
+            const fulfillR = await shopifyRequest(host, accessToken,
+              `/admin/api/2024-10/fulfillments.json`, 'POST', {
+                fulfillment: {
+                  line_items_by_fulfillment_order: [{ fulfillment_order_id: fo.id }],
+                  notify_customer: false,
+                  tracking_company: courierName,
+                }
+              });
+            console.log('MM FO fulfill status:', fulfillR.status, JSON.stringify(fulfillR.data).slice(0,200));
+            if (fulfillR.status === 200 || fulfillR.status === 201) {
+              fulfilled = true;
+              errors.length = 0;
+            }
+          }
+        }
+      } catch(e5) { console.warn('MM FOs fallback:', e5.message); }
+    }
+
+    // Fallback 2: جرب الـ assigned fulfillment orders (requested)
       try {
         const assignedR = await shopifyRequest(host, accessToken,
           `/admin/api/2024-10/assigned_fulfillment_orders.json?assignment_status=fulfillment_requested`);
