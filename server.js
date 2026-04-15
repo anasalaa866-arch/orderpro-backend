@@ -180,6 +180,17 @@ async function initDB() {
       "ALTER TABLE settlements ADD COLUMN IF NOT EXISTS adj TEXT DEFAULT '[]'",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER",
+      `CREATE TABLE IF NOT EXISTS order_history (
+        id SERIAL PRIMARY KEY,
+        order_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        field TEXT,
+        old_value TEXT,
+        new_value TEXT,
+        user_name TEXT,
+        ts TIMESTAMPTZ DEFAULT NOW()
+      )`,
+      "CREATE INDEX IF NOT EXISTS idx_order_history_order_id ON order_history(order_id)",
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); } catch(e) {}
@@ -365,6 +376,17 @@ app.post('/api/orders', async (req, res) => {
   res.json({ order: rowToOrder(rows[0]) });
 });
 
+// helper — سجل حدث في تاريخ الطلب
+async function logOrderHistory(orderId, action, details={}) {
+  if (!DB_ENABLED) return;
+  try {
+    await pool.query(
+      'INSERT INTO order_history (order_id, action, field, old_value, new_value, user_name) VALUES ($1,$2,$3,$4,$5,$6)',
+      [orderId, action, details.field||null, details.old||null, details.new||null, details.user||'system']
+    );
+  } catch(e) { console.warn('logOrderHistory:', e.message); }
+}
+
 app.patch('/api/orders/:id', async (req, res) => {
   const b = req.body;
   if (!DB_ENABLED) {
@@ -387,6 +409,11 @@ app.patch('/api/orders/:id', async (req, res) => {
     items:'items', total:'total', lineItemsJson:'line_items_json',
     batchCode:'batch_code', sourceName:'source_name',
   };
+
+  // جيب القيم القديمة للـ history
+  const { rows: oldRows } = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
+  const oldRow = oldRows[0] || {};
+
   Object.entries(b).forEach(([k, v]) => {
     if (map[k]) { sets.push(`${map[k]}=$${vals.length+1}`); vals.push(v); }
   });
@@ -394,8 +421,52 @@ app.patch('/api/orders/:id', async (req, res) => {
   sets.push(`updated_at=NOW()`);
   vals.push(req.params.id);
   await pool.query(`UPDATE orders SET ${sets.join(',')} WHERE id=$${vals.length}`, vals);
+
+  // سجل في الـ history
+  const userName = b._user || 'مستخدم';
+  if (b.status && b.status !== oldRow.status) {
+    await logOrderHistory(req.params.id, 'تغيير الحالة', {field:'status', old:oldRow.status, new:b.status, user:userName});
+  }
+  if (b.courierId !== undefined && String(b.courierId) !== String(oldRow.courier_id)) {
+    const newCourier = b.courierId || (b.isBosta ? 'بوسطة' : 'غير معيّن');
+    await logOrderHistory(req.params.id, 'تعيين مندوب', {field:'courier', old:oldRow.courier_id||'—', new:newCourier, user:userName});
+  }
+  if (b.name && b.name !== oldRow.name) {
+    await logOrderHistory(req.params.id, 'تعديل البيانات', {field:'name', old:oldRow.name, new:b.name, user:userName});
+  }
+  if (b.paid !== undefined && b.paid !== oldRow.paid) {
+    await logOrderHistory(req.params.id, 'تغيير حالة الدفع', {field:'paid', old:String(oldRow.paid), new:String(b.paid), user:userName});
+  }
+
   const { rows } = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
   res.json({ order: rows[0] ? rowToOrder(rows[0]) : null });
+});
+
+// ===== ORDER HISTORY =====
+app.get('/api/orders/:id/history', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ history: [] });
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM order_history WHERE order_id=$1 ORDER BY ts DESC LIMIT 50',
+      [req.params.id]
+    );
+    res.json({ history: rows.map(r => ({
+      id: r.id,
+      action: r.action,
+      field: r.field,
+      oldValue: r.old_value,
+      newValue: r.new_value,
+      userName: r.user_name,
+      ts: r.ts,
+    })) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// تسجيل حدث يدوي من الفرونتند
+app.post('/api/orders/:id/history', async (req, res) => {
+  const { action, field, oldValue, newValue, userName } = req.body;
+  await logOrderHistory(req.params.id, action, { field, old:oldValue, new:newValue, user:userName||'مستخدم' });
+  res.json({ ok: true });
 });
 
 app.delete('/api/orders/:id', async (req, res) => {
@@ -405,6 +476,7 @@ app.delete('/api/orders/:id', async (req, res) => {
 });
 
 // ===== IMPORT FROM SHOPIFY =====
+
 app.post('/api/import-shopify', async (req, res) => {
   const { shopUrl, accessToken, days = 15 } = req.body;
   if (!shopUrl || !accessToken) return res.status(400).json({ error: 'بيانات ناقصة' });
