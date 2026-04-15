@@ -1084,7 +1084,11 @@ function shopifyRequest(host, accessToken, path, method = 'GET', body = null) {
 app.get('/api/check-books', async (req, res) => {
   if (!DB_ENABLED) return res.json({ books: [] });
   const { rows } = await pool.query('SELECT * FROM check_books ORDER BY created_at');
-  res.json({ books: rows.map(r => ({ id:r.id, name:r.name, bank:r.bank, account:r.account, pages:r.pages, note:r.note })) });
+  res.json({ books: rows.map(r => ({
+    id:r.id, name:r.name, bank:r.bank, account:r.account,
+    pages:r.pages, note:r.note,
+    firstNum: r.first_num||1, lastNum: r.last_num||null
+  })) });
 });
 
 app.post('/api/check-books', async (req, res) => {
@@ -1139,14 +1143,17 @@ app.delete('/api/checks/:id', async (req, res) => {
 
 // Sync bulk - يستقبل كل الشيكات والدفاتر مرة واحدة
 app.post('/api/sync-checks', async (req, res) => {
-  const { books, checks } = req.body;
+  const { books, checks, suppliers } = req.body;
   if (!DB_ENABLED) return res.json({ ok: true });
   try {
     // sync books
     for (const b of (books||[])) {
       await pool.query(
-        'INSERT INTO check_books (id,name,bank,account,pages,note) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6',
-        [b.id, b.name, b.bank||'', b.account||'', b.pages||48, b.note||'']
+        `INSERT INTO check_books (id,name,bank,account,pages,note,first_num,last_num)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT (id) DO UPDATE SET
+         name=$2,bank=$3,account=$4,pages=$5,note=$6,first_num=$7,last_num=$8`,
+        [b.id, b.name||'', b.bank||'', b.account||'', b.pages||48, b.note||'', b.firstNum||1, b.lastNum||null]
       );
     }
     // sync checks
@@ -1155,12 +1162,28 @@ app.post('/api/sync-checks', async (req, res) => {
         `INSERT INTO checks (id,num,payee,amount,date,book_id,invoice,note,img,status,done_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
          ON CONFLICT (id) DO UPDATE SET
-         num=$2,payee=$3,amount=$4,date=$5,book_id=$6,invoice=$7,note=$8,status=$10,done_at=$11`,
-        [c.id, c.num, c.payee, c.amount||0, c.date||null, c.bookId||null, c.invoice||'', c.note||'', c.img||'', c.status||'pending', c.doneAt||null]
+         num=$2,payee=$3,amount=$4,date=$5,book_id=$6,invoice=$7,note=$8,img=$9,status=$10,done_at=$11`,
+        [c.id, c.num, c.payee||'', c.amount||0, c.date||null, c.bookId||null,
+         c.invoice||'', c.note||'', c.img||'', c.status||'pending', c.doneAt||null]
       );
+    }
+    // sync suppliers
+    if (suppliers && suppliers.length) {
+      try {
+        await pool.query("CREATE TABLE IF NOT EXISTS check_suppliers (id TEXT PRIMARY KEY, name TEXT)");
+        for (const s of suppliers) {
+          const sid = s.id || (Date.now()+'_sup');
+          const sname = s.name || s;
+          if (sname) await pool.query(
+            'INSERT INTO check_suppliers (id,name) VALUES ($1,$2) ON CONFLICT (id) DO UPDATE SET name=$2',
+            [sid, sname]
+          );
+        }
+      } catch(e) { console.warn('sync suppliers:', e.message); }
     }
     res.json({ ok: true, books: (books||[]).length, checks: (checks||[]).length });
   } catch(e) {
+    console.error('sync-checks error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
