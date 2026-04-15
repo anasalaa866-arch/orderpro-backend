@@ -177,6 +177,8 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_price NUMERIC DEFAULT 0",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS source_name TEXT DEFAULT ''",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS batch_code TEXT DEFAULT ''",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS merged_into TEXT DEFAULT NULL",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS merged_ids TEXT DEFAULT NULL",
       "ALTER TABLE settlements ADD COLUMN IF NOT EXISTS adj TEXT DEFAULT '[]'",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1",
       "ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER",
@@ -279,6 +281,8 @@ function rowToOrder(r) {
     shippingPrice: parseFloat(r.shipping_price) || 0,
     sourceName: r.source_name || '',
     batchCode: r.batch_code || '',
+    mergedInto: r.merged_into || null,
+    mergedIds: r.merged_ids ? JSON.parse(r.merged_ids) : null,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
 }
@@ -387,6 +391,34 @@ async function logOrderHistory(orderId, action, details={}) {
   } catch(e) { console.warn('logOrderHistory:', e.message); }
 }
 
+// ===== MERGE ORDERS =====
+app.post('/api/orders/merge', async (req, res) => {
+  const { primaryId, secondaryIds, mergedTotal, mergedItems, mergedLineItemsJson, shipMode, shipCost } = req.body;
+  if (!primaryId || !secondaryIds?.length) return res.status(400).json({ error: 'بيانات ناقصة' });
+  if (!DB_ENABLED) return res.json({ ok: true });
+  try {
+    // حدّث الطلب الرئيسي
+    const allIds = [primaryId, ...secondaryIds];
+    const mergedLabel = allIds.join(' + ');
+    await pool.query(
+      `UPDATE orders SET total=$1, items=$2, line_items_json=$3, ship=$4, merged_ids=$5, updated_at=NOW() WHERE id=$6`,
+      [mergedTotal, mergedItems, mergedLineItemsJson||null, shipCost||50, JSON.stringify(allIds), primaryId]
+    );
+    // الطلبات الثانوية → حالة "مدمج"
+    for (const sid of secondaryIds) {
+      await pool.query(
+        `UPDATE orders SET status='مدمج', merged_into=$1, updated_at=NOW() WHERE id=$2`,
+        [primaryId, sid]
+      );
+    }
+    // سجل في التاريخ
+    await logOrderHistory(primaryId, 'دمج طلبات', {
+      field: 'merged', new: secondaryIds.join(', '), user: req.body._user||'مستخدم'
+    });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.patch('/api/orders/:id', async (req, res) => {
   const b = req.body;
   if (!DB_ENABLED) {
@@ -408,6 +440,7 @@ app.patch('/api/orders/:id', async (req, res) => {
     province:'province',
     items:'items', total:'total', lineItemsJson:'line_items_json',
     batchCode:'batch_code', sourceName:'source_name',
+    mergedInto:'merged_into', mergedIds:'merged_ids',
   };
 
   // جيب القيم القديمة للـ history
