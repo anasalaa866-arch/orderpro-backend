@@ -1182,11 +1182,19 @@ app.post('/api/shopify/diagnose', async (req, res) => {
 
 // ===== SHOPIFY ASSIGN: Fulfill + Tag =====
 app.post('/api/shopify/assign', async (req, res) => {
-  const { shopUrl, accessToken, shopifyOrderId, courierName, orderId } = req.body;
-  console.log('shopify/assign called:', { shopifyOrderId, courierName, orderId });
+  let { shopUrl, accessToken, shopifyOrderId, courierName, orderId } = req.body;
+
+  // لو الفرونتند مبعتش credentials (مستخدم مش مدير)، جيبها من DB
+  if (!shopUrl || !accessToken) {
+    const creds = await getShopifyCredentials();
+    shopUrl = shopUrl || creds.shopUrl;
+    accessToken = accessToken || creds.accessToken;
+  }
+
+  console.log('shopify/assign called:', { shopifyOrderId, courierName, orderId, hasCredsInBody: !!req.body.shopUrl });
 
   if (!shopUrl || !accessToken || !shopifyOrderId) {
-    return res.status(400).json({ success: false, error: 'بيانات ناقصة' });
+    return res.status(400).json({ success: false, error: 'بيانات ناقصة — الـ credentials مش محفوظة على السيرفر' });
   }
 
   const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
