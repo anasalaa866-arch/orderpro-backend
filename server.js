@@ -977,20 +977,51 @@ app.post('/api/shopify/fetch-line-items', async (req, res) => {
     if (r.status !== 200) return res.status(r.status).json({ error: r.data });
 
     const sh = r.data.order;
-    const lineItemsJson = JSON.stringify((sh.line_items || []).map(i => ({
-      name: i.name,
-      title: i.title,
-      variantTitle: i.variant_title || '',
-      sku: i.sku || '',
-      quantity: i.quantity,
-      price: parseFloat(i.price) || 0,
-      totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
-      image: (i.image && i.image.src) ? i.image.src : null,
-    })));
+    const items = sh.line_items || [];
+
+    // جيب الصور من products API لكل منتج مش عنده صورة في line_item
+    const productImageCache = {};
+    const variantImageCache = {};
+    const productIds = [...new Set(items.filter(i => !(i.image && i.image.src)).map(i => i.product_id).filter(Boolean))];
+
+    for (const pid of productIds) {
+      try {
+        const pr = await shopifyRequest(host, accessToken,
+          `/admin/api/2024-10/products/${pid}.json?fields=id,image,images,variants`);
+        if (pr.status === 200 && pr.data.product) {
+          const p = pr.data.product;
+          // صورة رئيسية للمنتج
+          if (p.image && p.image.src) productImageCache[pid] = p.image.src;
+          // صور الـ variants
+          (p.images || []).forEach(img => {
+            (img.variant_ids || []).forEach(vid => {
+              variantImageCache[vid] = img.src;
+            });
+          });
+        }
+      } catch(e) { console.warn('fetch product img:', pid, e.message); }
+    }
+
+    const lineItemsJson = JSON.stringify(items.map(i => {
+      let imageUrl = (i.image && i.image.src) ? i.image.src : null;
+      if (!imageUrl && i.variant_id && variantImageCache[i.variant_id]) imageUrl = variantImageCache[i.variant_id];
+      if (!imageUrl && i.product_id && productImageCache[i.product_id]) imageUrl = productImageCache[i.product_id];
+      return {
+        name: i.name,
+        title: i.title,
+        variantTitle: i.variant_title || '',
+        sku: i.sku || '',
+        quantity: i.quantity,
+        price: parseFloat(i.price) || 0,
+        totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
+        image: imageUrl,
+        productId: i.product_id,
+        variantId: i.variant_id,
+      };
+    }));
     const subtotalPrice = parseFloat(sh.subtotal_price) || 0;
     const shippingPrice = (sh.shipping_lines || []).reduce((s, l) => s + (parseFloat(l.price) || 0), 0);
 
-    // حدّث الـ DB
     if (DB_ENABLED && orderId) {
       await pool.query(
         'UPDATE orders SET line_items_json=$1, subtotal_price=$2, shipping_price=$3, updated_at=NOW() WHERE id=$4',
