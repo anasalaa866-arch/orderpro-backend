@@ -403,6 +403,18 @@ app.post('/webhook/shopify', async (req, res) => {
     return res.status(200).json({ received: true });
   }
   const o = mapShopifyOrder(sh);
+
+  // ✨ جيب صور المنتجات قبل الحفظ
+  try {
+    const shopUrl = process.env.SHOPIFY_SHOP_URL || '';
+    const accessToken = process.env.SHOPIFY_ACCESS_TOKEN || '';
+    if (shopUrl && accessToken && sh.line_items && sh.line_items.length) {
+      const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      const enriched = await enrichLineItemsWithImages(sh.line_items, host, accessToken);
+      o.line_items_json = JSON.stringify(enriched);
+    }
+  } catch(e) { console.warn('Webhook image fetch failed:', e.message); }
+
   try {
     if (DB_ENABLED) {
       await pool.query(`
@@ -616,7 +628,19 @@ app.post('/api/import-shopify', async (req, res) => {
     } else {
       // PostgreSQL - bulk upsert أسرع بكتير
       const mappedOrders = shopifyOrders.map(sh => mapShopifyOrder(sh));
-      
+
+      // ✨ جيب صور المنتجات لكل طلب
+      const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      for (let i = 0; i < shopifyOrders.length; i++) {
+        const sh = shopifyOrders[i];
+        if (sh.line_items && sh.line_items.length) {
+          try {
+            const enriched = await enrichLineItemsWithImages(sh.line_items, host, accessToken);
+            mappedOrders[i].line_items_json = JSON.stringify(enriched);
+          } catch(e) { console.warn('Image fetch for', mappedOrders[i].id, ':', e.message); }
+        }
+      }
+
       // جيب كل الـ IDs الموجودة مرة واحدة بدل query لكل طلب
       const allIds = mappedOrders.map(o => o.id);
       const allShopifyIds = mappedOrders.map(o => o.shopify_id);
@@ -966,6 +990,51 @@ async function fetchShopifyOrders(shopUrl, accessToken, sinceDate) {
 
 // ===== SHOPIFY DIAGNOSE =====
 // جيب line items مع الصور لطلب معين وحدّث الـ DB
+// ===== BACKFILL IMAGES FOR EXISTING ORDERS =====
+app.post('/api/shopify/backfill-images', async (req, res) => {
+  const { shopUrl, accessToken, limit = 50 } = req.body;
+  if (!shopUrl || !accessToken) return res.status(400).json({ error: 'بيانات ناقصة' });
+  if (!DB_ENABLED) return res.json({ done: 0, skipped: 0, error: 'DB not enabled' });
+  const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+
+  try {
+    // جيب الطلبات من Shopify اللي مش عندها صور كاملة
+    const { rows } = await pool.query(
+      "SELECT id, shopify_id, line_items_json FROM orders WHERE src='shopify' AND shopify_id IS NOT NULL ORDER BY created_at DESC LIMIT $1",
+      [limit]
+    );
+
+    let done = 0, skipped = 0, failed = 0;
+    for (const row of rows) {
+      try {
+        // تحقق لو الطلب فعلاً محتاج صور
+        let items = [];
+        try { items = JSON.parse(row.line_items_json || '[]'); } catch(e) {}
+        const hasAllImages = items.length > 0 && items.every(i => i.image);
+        if (hasAllImages) { skipped++; continue; }
+
+        const r = await shopifyRequest(host, accessToken,
+          `/admin/api/2024-10/orders/${row.shopify_id}.json?fields=line_items,subtotal_price,shipping_lines`);
+        if (r.status !== 200) { failed++; continue; }
+
+        const sh = r.data.order;
+        const enriched = await enrichLineItemsWithImages(sh.line_items || [], host, accessToken);
+        const lineItemsJson = JSON.stringify(enriched);
+        const subtotalPrice = parseFloat(sh.subtotal_price) || 0;
+        const shippingPrice = (sh.shipping_lines || []).reduce((s, l) => s + (parseFloat(l.price) || 0), 0);
+
+        await pool.query(
+          'UPDATE orders SET line_items_json=$1, subtotal_price=$2, shipping_price=$3, updated_at=NOW() WHERE id=$4',
+          [lineItemsJson, subtotalPrice, shippingPrice, row.id]
+        );
+        done++;
+      } catch(e) { console.warn('Backfill', row.id, e.message); failed++; }
+    }
+
+    res.json({ total: rows.length, done, skipped, failed });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/shopify/fetch-line-items', async (req, res) => {
   const { shopUrl, accessToken, shopifyOrderId, orderId } = req.body;
   if (!shopUrl || !accessToken || !shopifyOrderId)
@@ -977,48 +1046,8 @@ app.post('/api/shopify/fetch-line-items', async (req, res) => {
     if (r.status !== 200) return res.status(r.status).json({ error: r.data });
 
     const sh = r.data.order;
-    const items = sh.line_items || [];
-
-    // جيب الصور من products API لكل منتج مش عنده صورة في line_item
-    const productImageCache = {};
-    const variantImageCache = {};
-    const productIds = [...new Set(items.filter(i => !(i.image && i.image.src)).map(i => i.product_id).filter(Boolean))];
-
-    for (const pid of productIds) {
-      try {
-        const pr = await shopifyRequest(host, accessToken,
-          `/admin/api/2024-10/products/${pid}.json?fields=id,image,images,variants`);
-        if (pr.status === 200 && pr.data.product) {
-          const p = pr.data.product;
-          // صورة رئيسية للمنتج
-          if (p.image && p.image.src) productImageCache[pid] = p.image.src;
-          // صور الـ variants
-          (p.images || []).forEach(img => {
-            (img.variant_ids || []).forEach(vid => {
-              variantImageCache[vid] = img.src;
-            });
-          });
-        }
-      } catch(e) { console.warn('fetch product img:', pid, e.message); }
-    }
-
-    const lineItemsJson = JSON.stringify(items.map(i => {
-      let imageUrl = (i.image && i.image.src) ? i.image.src : null;
-      if (!imageUrl && i.variant_id && variantImageCache[i.variant_id]) imageUrl = variantImageCache[i.variant_id];
-      if (!imageUrl && i.product_id && productImageCache[i.product_id]) imageUrl = productImageCache[i.product_id];
-      return {
-        name: i.name,
-        title: i.title,
-        variantTitle: i.variant_title || '',
-        sku: i.sku || '',
-        quantity: i.quantity,
-        price: parseFloat(i.price) || 0,
-        totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
-        image: imageUrl,
-        productId: i.product_id,
-        variantId: i.variant_id,
-      };
-    }));
+    const enriched = await enrichLineItemsWithImages(sh.line_items || [], host, accessToken);
+    const lineItemsJson = JSON.stringify(enriched);
     const subtotalPrice = parseFloat(sh.subtotal_price) || 0;
     const shippingPrice = (sh.shipping_lines || []).reduce((s, l) => s + (parseFloat(l.price) || 0), 0);
 
@@ -1327,6 +1356,50 @@ app.post('/api/shopify/assign', async (req, res) => {
   console.log('shopify/assign result:', { success: errors.length === 0, errors });
   res.json({ success: errors.length === 0, errors, message: errors.length ? errors.join(' | ') : 'تم بنجاح' });
 });
+
+// ===== ENRICH LINE ITEMS WITH PRODUCT IMAGES =====
+// بيجيب صور المنتجات من Products API ويربطهم بالـ line_items
+async function enrichLineItemsWithImages(lineItems, host, accessToken) {
+  if (!lineItems || !lineItems.length || !host || !accessToken) return lineItems;
+
+  const productImageCache = {};
+  const variantImageCache = {};
+  const productIds = [...new Set(lineItems.filter(i => !(i.image && i.image.src)).map(i => i.product_id).filter(Boolean))];
+
+  for (const pid of productIds) {
+    try {
+      const pr = await shopifyRequest(host, accessToken,
+        `/admin/api/2024-10/products/${pid}.json?fields=id,image,images,variants`);
+      if (pr.status === 200 && pr.data.product) {
+        const p = pr.data.product;
+        if (p.image && p.image.src) productImageCache[pid] = p.image.src;
+        (p.images || []).forEach(img => {
+          (img.variant_ids || []).forEach(vid => {
+            variantImageCache[vid] = img.src;
+          });
+        });
+      }
+    } catch(e) { console.warn('enrich product img:', pid, e.message); }
+  }
+
+  return lineItems.map(i => {
+    let imageUrl = (i.image && i.image.src) ? i.image.src : null;
+    if (!imageUrl && i.variant_id && variantImageCache[i.variant_id]) imageUrl = variantImageCache[i.variant_id];
+    if (!imageUrl && i.product_id && productImageCache[i.product_id]) imageUrl = productImageCache[i.product_id];
+    return {
+      name: i.name,
+      title: i.title,
+      variantTitle: i.variant_title || '',
+      sku: i.sku || '',
+      quantity: i.quantity,
+      price: parseFloat(i.price) || 0,
+      totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
+      image: imageUrl,
+      productId: i.product_id,
+      variantId: i.variant_id,
+    };
+  });
+}
 
 function shopifyRequest(host, accessToken, path, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
