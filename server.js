@@ -195,6 +195,13 @@ async function initDB() {
         ts TIMESTAMPTZ DEFAULT NOW()
       )`,
       "CREATE INDEX IF NOT EXISTS idx_order_history_order_id ON order_history(order_id)",
+      `CREATE TABLE IF NOT EXISTS invoice_cache (
+        order_id TEXT PRIMARY KEY,
+        html TEXT NOT NULL,
+        generated_at TIMESTAMPTZ DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL
+      )`,
+      "CREATE INDEX IF NOT EXISTS idx_invoice_cache_expires ON invoice_cache(expires_at)",
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); } catch(e) {}
@@ -444,6 +451,8 @@ app.post('/webhook/shopify', async (req, res) => {
       if (idx<0) memOrders.unshift({...o, shopifyId:o.shopify_id, courierId:null});
     }
     res.status(200).json({ received: true });
+    // Trigger invoice cache generation asynchronously (don't block webhook response)
+    setImmediate(() => cacheInvoiceForOrder(o.id).catch(e => console.warn('webhook cache:', e.message)));
   } catch (err) {
     console.error('Webhook DB error:', err.message);
     res.status(500).json({ error: err.message });
@@ -476,6 +485,8 @@ app.post('/api/orders', async (req, res) => {
       newOrder.time, now]);
   const { rows } = await pool.query('SELECT * FROM orders WHERE id=$1', [id]);
   res.json({ order: rowToOrder(rows[0]) });
+  // ولّد الفاتورة في الخلفية
+  setImmediate(() => cacheInvoiceForOrder(id).catch(e => console.warn('manual order cache:', e.message)));
 });
 
 // helper — سجل حدث في تاريخ الطلب
@@ -571,6 +582,13 @@ app.patch('/api/orders/:id', async (req, res) => {
 
   const { rows } = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
   res.json({ order: rows[0] ? rowToOrder(rows[0]) : null });
+  // حدّث الفاتورة في الخلفية — امسح القديمة وولّد جديدة
+  setImmediate(async () => {
+    try {
+      await pool.query('DELETE FROM invoice_cache WHERE order_id=$1', [req.params.id]);
+      await cacheInvoiceForOrder(req.params.id);
+    } catch(e) { console.warn('patch invoice cache:', e.message); }
+  });
 });
 
 // ===== ORDER HISTORY =====
@@ -693,6 +711,15 @@ app.post('/api/import-shopify', async (req, res) => {
     res.json({ success: true, imported, updated, total: shopifyOrders.length,
       pages: Math.ceil(shopifyOrders.length / 250),
       message: `تم استيراد ${imported} طلب جديد وتحديث ${updated} طلب` });
+
+    // Pre-generate invoices for all imported orders in background
+    setImmediate(async () => {
+      for (const sh of shopifyOrders) {
+        const orderId = 'SH-' + sh.order_number;
+        try { await cacheInvoiceForOrder(orderId); } catch(e) {}
+      }
+      console.log('✅ Pre-generated invoices for', shopifyOrders.length, 'imported orders');
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1359,6 +1386,281 @@ app.post('/api/shopify/assign', async (req, res) => {
 
 // ===== ENRICH LINE ITEMS WITH PRODUCT IMAGES =====
 // بيجيب صور المنتجات من Products API ويربطهم بالـ line_items
+// ===== INVOICE HTML GENERATOR (CACHED) =====
+// بيبني HTML كامل للفاتورة مع الصور كـ base64 inline
+// النتيجة بتتحفظ في DB لمدة أسبوع، وبتتولد تلقائياً عند إنشاء/تعديل الطلب
+
+function fetchImageAsBase64(imageUrl) {
+  return new Promise((resolve) => {
+    if (!imageUrl || !imageUrl.startsWith('http')) return resolve(null);
+    try {
+      const url = new URL(imageUrl);
+      const mod = url.protocol === 'https:' ? require('https') : require('http');
+      const req = mod.get(imageUrl, { timeout: 8000 }, (res) => {
+        if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            const buf = Buffer.concat(chunks);
+            if (buf.length > 500 * 1024) return resolve(null); // اقل من 500KB
+            const mime = res.headers['content-type'] || 'image/jpeg';
+            resolve('data:' + mime + ';base64,' + buf.toString('base64'));
+          } catch(e) { resolve(null); }
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+    } catch(e) { resolve(null); }
+  });
+}
+
+async function generateInvoiceHtml(order, couriersArr) {
+  // جيب line items مع الصور (مرّة واحدة) وحوّلهم لـ base64
+  let lineItems = [];
+  try { lineItems = JSON.parse(order.line_items_json || order.lineItemsJson || '[]'); } catch(e) {}
+
+  // للطلبات Shopify: تأكد إن الصور موجودة، وإن لم تكن - جيبها
+  if (order.src === 'shopify' && (order.shopify_id || order.shopifyId)) {
+    const hasAllImages = lineItems.length > 0 && lineItems.every(i => i.image);
+    if (!hasAllImages) {
+      const shopUrl = process.env.SHOPIFY_SHOP_URL || '';
+      const accessToken = process.env.SHOPIFY_ACCESS_TOKEN || '';
+      if (shopUrl && accessToken) {
+        try {
+          const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+          const r = await shopifyRequest(host, accessToken,
+            `/admin/api/2024-10/orders/${order.shopify_id || order.shopifyId}.json?fields=line_items`);
+          if (r.status === 200 && r.data.order) {
+            lineItems = await enrichLineItemsWithImages(r.data.order.line_items || [], host, accessToken);
+          }
+        } catch(e) { console.warn('fetch images for invoice:', e.message); }
+      }
+    }
+  }
+
+  // fallback لو مفيش line items
+  if (!lineItems.length && order.items) {
+    lineItems = order.items.split(',').map(s=>{
+      s=s.trim();
+      const m=s.match(/^(.+?)\s+x(\d+)$/i);
+      if(m) return {name:m[1].trim(), quantity:parseInt(m[2]), price:0, totalPrice:0};
+      return {name:s, quantity:1, price:0, totalPrice:0};
+    }).filter(i=>i.name);
+  }
+  if (!lineItems.length) lineItems = [{name: order.details || '—', quantity: 1, price: order.total || 0, totalPrice: order.total || 0}];
+
+  // حوّل الصور لـ base64 (مع تحديد وقت max 30 ثانية إجمالاً)
+  const imagePromises = lineItems.map(i => i.image ? fetchImageAsBase64(i.image) : Promise.resolve(null));
+  const base64Images = await Promise.all(imagePromises);
+  lineItems.forEach((i, idx) => { if (base64Images[idx]) i.image = base64Images[idx]; else if (!base64Images[idx] && i.image) i.image = null; });
+
+  // بيانات العنوان بدون تكرار
+  const addrParts = [];
+  if (order.addr) addrParts.push(order.addr);
+  if (order.area && !(order.addr||'').includes(order.area)) addrParts.push(order.area);
+  const addr1 = addrParts.filter(Boolean).filter((v,i,a)=>a.indexOf(v)===i).join('<br>') || (order.area||'');
+
+  const courierName = order.courier_id || order.courierId
+    ? (couriersArr.find(c=>String(c.id)===String(order.courier_id || order.courierId))?.name||'—')
+    : null;
+  const deliveryLabel = order.is_bosta || order.isBosta ? 'Bosta'
+    : (order.delivery_type||order.deliveryType)==='pickup' ? 'Store Pickup'
+    : courierName ? courierName : '—';
+  const _src = order.src||'';
+  const _sn = String(order.source_name || order.sourceName || '');
+  const sourceLabel = _src==='manual' ? 'Manual'
+    : _src!=='shopify' ? (_src||'—')
+    : _sn==='web' || _sn==='' ? 'Website'
+    : _sn==='shopify_draft_orders' ? 'Draft Order'
+    : _sn==='pos' ? 'POS'
+    : /^\d+$/.test(_sn) ? 'Mobile App'
+    : _sn;
+
+  const totalItems = lineItems.reduce((s,i)=>s+(i.quantity||1),0);
+  const uniqueItems = lineItems.length;
+  const orderNum = (order.id || '').toString().replace('SH-','').replace('MN-','');
+  const orderDate = order.created_at || order.createdAt
+    ? new Date(order.created_at || order.createdAt).toLocaleDateString('en-GB',{year:'numeric',month:'long',day:'numeric'})
+    : new Date().toLocaleDateString('en-GB',{year:'numeric',month:'long',day:'numeric'});
+  const subtotal = parseFloat(order.subtotal_price || order.subtotalPrice) > 0
+    ? parseFloat(order.subtotal_price || order.subtotalPrice)
+    : lineItems.reduce((s,i)=>s+(i.totalPrice || (i.price*(i.quantity||1)) || 0),0) || parseFloat(order.total||0);
+  const shippingCost = parseFloat(order.shipping_price || order.shippingPrice || 0);
+  const total = parseFloat(order.total || subtotal);
+  const fmtMoney = n => `EGP ${(n||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+
+  const qtyFreq = {};
+  lineItems.forEach(i=>{ const q=i.quantity||1; qtyFreq[q]=(qtyFreq[q]||0)+1; });
+  const commonQty = parseInt(Object.entries(qtyFreq).sort((a,b)=>b[1]-a[1])[0][0]);
+
+  const itemsHtml = lineItems.map(i=>{
+    const qty = i.quantity || 1;
+    const lineTotal = i.totalPrice || (i.price*qty) || 0;
+    const isDiff = lineItems.length > 1 && qty > commonQty;
+    const imgHtml = i.image
+      ? `<div style="width:64px;height:64px"><img src="${i.image}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:4px"></div>`
+      : `<div style="width:64px;height:64px;background:#fafbfc;display:flex;align-items:center;justify-content:center;font-size:22px;border-radius:4px">📦</div>`;
+    const qtyHtml = isDiff
+      ? `<div style="min-width:40px;text-align:center;border:2.5px solid #000;border-radius:4px;padding:2px 4px"><div style="font-size:28px;font-weight:900;line-height:1;color:#000">${qty}</div><div style="font-size:8px;font-weight:700;color:#000;margin-top:1px">!!</div></div>`
+      : `<div style="font-size:15px;font-weight:400;width:40px;text-align:left;color:#555">${qty} ×</div>`;
+    const rowStyle = isDiff ? 'border:2px solid #000;border-radius:4px;margin:4px -4px;padding:6px 4px;' : '';
+    return `<div style="display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid #e5e7eb;${rowStyle}">${qtyHtml}${imgHtml}<div style="flex:1"><div style="${isDiff?'font-weight:700;':''}font-size:14px">${(i.name||'').replace(/[<>]/g,'')}</div>${i.variantTitle?`<div style="font-size:11px;color:#6b7280">${i.variantTitle}</div>`:''}${i.sku?`<div style="font-size:11px;color:#6b7280">SKU: ${i.sku}</div>`:''}${i.price>0?`<div style="font-size:11px;color:#6b7280">${fmtMoney(i.price)}</div>`:''}</div><div style="text-align:left;font-weight:700;font-size:14px">${lineTotal>0?fmtMoney(lineTotal):''}</div></div>`;
+  }).join('');
+
+  return `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><title>Order ${orderNum}</title>
+<style>
+  body{font-size:15px;margin:0;padding:0;font-family:"Noto Sans",Arial,sans-serif;font-weight:400}
+  *{box-sizing:border-box}
+  .wrapper{width:831px;margin:auto;padding:3em}
+  .header{display:flex;justify-content:space-between;align-items:start;margin-bottom:20px}
+  .brand{font-size:28px;font-weight:800}
+  .order-info{text-align:left;font-size:13px}
+  .order-info .code{font-weight:700}
+  .ship-to{margin-bottom:20px}
+  .ship-label{font-size:11px;font-weight:700;text-transform:uppercase;margin-bottom:6px}
+  .summary-box{margin:1.2em 0.7em 0;border:1.5px solid #000;border-radius:4px;padding:10px 14px;font-size:11px;page-break-inside:avoid;break-inside:avoid}
+  .footer-thanks{text-align:center;margin-top:30px;font-size:12px;color:#555}
+  .print-btn{display:inline-block;background:#000;color:#fff;border:none;padding:10px 24px;border-radius:6px;font-size:14px;cursor:pointer;margin-top:10px}
+  @media print { .no-print{display:none!important} @page{margin:1cm} }
+</style></head>
+<body>
+<div class="wrapper">
+  <div class="header">
+    <div class="brand">CAFELAX</div>
+    <div class="order-info"><div class="code">Order ${orderNum}</div><div>${orderDate}</div>${order.batch_code || order.batchCode ? `<div style="font-size:10px;color:#6b7280;margin-top:2px">${order.batch_code || order.batchCode}</div>`:''}</div>
+  </div>
+  <div class="ship-to">
+    <div class="ship-label">Ship to</div>
+    <div style="font-size:14px;line-height:1.8"><strong>${(order.name||'').replace(/[<>]/g,'')}</strong><br>${addr1}<br>Egypt<br><span style="direction:ltr;unicode-bidi:plaintext">${order.phone||''}</span></div>
+  </div>
+  <hr>
+  <div style="display:flex;justify-content:space-between;font-size:11px;font-weight:700;text-transform:uppercase;padding-bottom:8px;border-bottom:1px solid #e5e7eb;margin-bottom:8px">
+    <div style="width:100px">Quantity</div>
+    <div style="flex:1;margin-left:60px">Items</div>
+    <div style="text-align:left">Total</div>
+  </div>
+  ${itemsHtml}
+  <div style="text-align:left;margin-top:15px;font-size:14px;font-weight:700;line-height:2">
+    Subtotal ${fmtMoney(subtotal)}<br>
+    Shipping ${fmtMoney(shippingCost)}<br>
+    Total ${fmtMoney(total)}
+  </div>
+  <hr>
+  <div class="summary-box">
+    <div style="display:flex;flex-wrap:wrap;gap:10px 28px;align-items:flex-start">
+      <div style="min-width:80px"><div style="text-transform:uppercase;font-size:9px;font-weight:700;letter-spacing:.06em;color:#555;margin-bottom:3px">Delivery</div><strong style="font-size:14px">${deliveryLabel}</strong></div>
+      <div style="min-width:80px"><div style="text-transform:uppercase;font-size:9px;font-weight:700;letter-spacing:.06em;color:#555;margin-bottom:3px">Source</div><strong style="font-size:14px">${sourceLabel}</strong></div>
+      <div style="min-width:80px"><div style="text-transform:uppercase;font-size:9px;font-weight:700;letter-spacing:.06em;color:#555;margin-bottom:3px">Unique Items</div><strong style="font-size:14px">${uniqueItems} items</strong></div>
+      <div style="border-right:2.5px solid #000;padding-right:16px"><div style="text-transform:uppercase;font-size:9px;font-weight:700;letter-spacing:.06em;color:#555;margin-bottom:3px">Total Pieces</div><strong style="font-size:22px">${totalItems} pcs</strong></div>
+    </div>
+  </div>
+  <div class="footer-thanks">
+    <h2 style="margin:10px 0">Thank you for shopping with us!</h2>
+    <p style="margin:4px 0"><strong>CAFELAX</strong><br>info@cafelax.com<br>www.cafelax.com</p>
+    <button class="print-btn no-print" onclick="window.print()">Print / Save PDF</button>
+  </div>
+</div>
+</body></html>`;
+}
+
+async function cacheInvoiceForOrder(orderId) {
+  if (!DB_ENABLED) return;
+  try {
+    // اقرأ الطلب من الـ DB
+    const { rows } = await pool.query('SELECT * FROM orders WHERE id=$1', [orderId]);
+    if (!rows.length) return;
+    const order = rows[0];
+
+    // اقرأ المناديب عشان نعرف اسم المندوب
+    const { rows: couriersRows } = await pool.query('SELECT * FROM couriers').catch(()=>({rows:[]}));
+
+    const html = await generateInvoiceHtml(order, couriersRows);
+    const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // أسبوع
+
+    await pool.query(`
+      INSERT INTO invoice_cache (order_id, html, generated_at, expires_at)
+      VALUES ($1, $2, NOW(), $3)
+      ON CONFLICT (order_id) DO UPDATE SET
+        html = EXCLUDED.html,
+        generated_at = NOW(),
+        expires_at = EXCLUDED.expires_at
+    `, [orderId, html, expires]);
+
+    console.log('✅ Invoice cached:', orderId);
+  } catch(e) { console.warn('cacheInvoiceForOrder:', orderId, e.message); }
+}
+
+// امسح الفواتير المنتهية (tombstone cleanup)
+async function cleanupExpiredInvoices() {
+  if (!DB_ENABLED) return;
+  try {
+    const r = await pool.query('DELETE FROM invoice_cache WHERE expires_at < NOW() RETURNING order_id');
+    if (r.rowCount > 0) console.log('🧹 Cleaned', r.rowCount, 'expired invoice caches');
+  } catch(e) {}
+}
+setInterval(cleanupExpiredInvoices, 6 * 60 * 60 * 1000); // كل 6 ساعات
+
+// ===== INVOICE CACHE ENDPOINTS =====
+
+// GET /api/orders/:id/invoice → يرجع الـ HTML جاهز للفاتورة
+app.get('/api/orders/:id/invoice', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).send('DB unavailable');
+  try {
+    // جرّب الكاش أولاً
+    const { rows } = await pool.query(
+      'SELECT html, generated_at, expires_at FROM invoice_cache WHERE order_id=$1 AND expires_at > NOW()',
+      [req.params.id]
+    );
+    if (rows.length) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.setHeader('X-Invoice-Cached', 'true');
+      res.setHeader('X-Invoice-Generated', rows[0].generated_at);
+      return res.send(rows[0].html);
+    }
+
+    // مش موجود → ولّد جديد
+    await cacheInvoiceForOrder(req.params.id);
+    const r2 = await pool.query('SELECT html FROM invoice_cache WHERE order_id=$1', [req.params.id]);
+    if (!r2.rows.length) return res.status(404).send('Order not found');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('X-Invoice-Cached', 'false');
+    res.send(r2.rows[0].html);
+  } catch(e) {
+    console.error('invoice endpoint:', e);
+    res.status(500).send('Error: ' + e.message);
+  }
+});
+
+// POST /api/orders/:id/invoice/refresh → يعيد توليد الفاتورة يدوياً
+app.post('/api/orders/:id/invoice/refresh', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM invoice_cache WHERE order_id=$1', [req.params.id]).catch(()=>{});
+    await cacheInvoiceForOrder(req.params.id);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/invoices/batch-generate → يولّد عدة فواتير مرة واحدة
+app.post('/api/invoices/batch-generate', async (req, res) => {
+  const { orderIds } = req.body;
+  if (!Array.isArray(orderIds) || !orderIds.length) return res.status(400).json({ error: 'orderIds مطلوبة' });
+  let generated = 0, cached = 0, failed = 0;
+  for (const id of orderIds) {
+    try {
+      const r = await pool.query(
+        'SELECT 1 FROM invoice_cache WHERE order_id=$1 AND expires_at > NOW()',
+        [id]
+      );
+      if (r.rows.length) { cached++; continue; }
+      await cacheInvoiceForOrder(id);
+      generated++;
+    } catch(e) { failed++; }
+  }
+  res.json({ total: orderIds.length, generated, cached, failed });
+});
+
 async function enrichLineItemsWithImages(lineItems, host, accessToken) {
   if (!lineItems || !lineItems.length || !host || !accessToken) return lineItems;
 
