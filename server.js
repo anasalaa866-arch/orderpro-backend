@@ -202,6 +202,11 @@ async function initDB() {
         expires_at TIMESTAMPTZ NOT NULL
       )`,
       "CREATE INDEX IF NOT EXISTS idx_invoice_cache_expires ON invoice_cache(expires_at)",
+      `CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); } catch(e) {}
@@ -413,8 +418,9 @@ app.post('/webhook/shopify', async (req, res) => {
 
   // ✨ جيب صور المنتجات قبل الحفظ
   try {
-    const shopUrl = process.env.SHOPIFY_SHOP_URL || '';
-    const accessToken = process.env.SHOPIFY_ACCESS_TOKEN || '';
+    const creds = await getShopifyCredentials();
+    const shopUrl = creds.shopUrl;
+    const accessToken = creds.accessToken;
     if (shopUrl && accessToken && sh.line_items && sh.line_items.length) {
       const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
       const enriched = await enrichLineItemsWithImages(sh.line_items, host, accessToken);
@@ -1390,6 +1396,28 @@ app.post('/api/shopify/assign', async (req, res) => {
 // بيبني HTML كامل للفاتورة مع الصور كـ base64 inline
 // النتيجة بتتحفظ في DB لمدة أسبوع، وبتتولد تلقائياً عند إنشاء/تعديل الطلب
 
+// بيجيب Shopify credentials من DB أو من env vars
+async function getShopifyCredentials() {
+  // جرّب DB أولاً
+  if (DB_ENABLED) {
+    try {
+      const { rows } = await pool.query(
+        "SELECT key, value FROM app_settings WHERE key IN ('shopify_url', 'shopify_token')"
+      );
+      const map = {};
+      rows.forEach(r => map[r.key] = r.value);
+      if (map.shopify_url && map.shopify_token) {
+        return { shopUrl: map.shopify_url, accessToken: map.shopify_token };
+      }
+    } catch(e) {}
+  }
+  // fallback env
+  return {
+    shopUrl: process.env.SHOPIFY_SHOP_URL || '',
+    accessToken: process.env.SHOPIFY_ACCESS_TOKEN || ''
+  };
+}
+
 function fetchImageAsBase64(imageUrl) {
   return new Promise((resolve) => {
     if (!imageUrl || !imageUrl.startsWith('http')) return resolve(null);
@@ -1424,8 +1452,9 @@ async function generateInvoiceHtml(order, couriersArr) {
   if (order.src === 'shopify' && (order.shopify_id || order.shopifyId)) {
     const hasAllImages = lineItems.length > 0 && lineItems.every(i => i.image);
     if (!hasAllImages) {
-      const shopUrl = process.env.SHOPIFY_SHOP_URL || '';
-      const accessToken = process.env.SHOPIFY_ACCESS_TOKEN || '';
+      const creds = await getShopifyCredentials();
+      const shopUrl = creds.shopUrl;
+      const accessToken = creds.accessToken;
       if (shopUrl && accessToken) {
         try {
           const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
@@ -1602,8 +1631,40 @@ async function cleanupExpiredInvoices() {
 }
 setInterval(cleanupExpiredInvoices, 6 * 60 * 60 * 1000); // كل 6 ساعات
 
-// ===== INVOICE CACHE ENDPOINTS =====
+// ===== APP SETTINGS ENDPOINTS =====
+// GET /api/settings → يرجع كل المفاتيح المحفوظة
+app.get('/api/settings', async (req, res) => {
+  if (!DB_ENABLED) return res.json({});
+  try {
+    const { rows } = await pool.query('SELECT key, value FROM app_settings');
+    const settings = {};
+    rows.forEach(r => settings[r.key] = r.value);
+    res.json(settings);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
+// POST /api/settings → يحفظ مفتاح واحد أو أكتر
+app.post('/api/settings', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  try {
+    const body = req.body || {};
+    const keys = Object.keys(body);
+    if (!keys.length) return res.status(400).json({ error: 'no keys' });
+    for (const key of keys) {
+      const value = String(body[key] || '');
+      await pool.query(`
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (key) DO UPDATE SET
+          value = EXCLUDED.value,
+          updated_at = NOW()
+      `, [key, value]);
+    }
+    res.json({ ok: true, saved: keys.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== INVOICE CACHE ENDPOINTS =====
 // GET /api/orders/:id/invoice → يرجع الـ HTML جاهز للفاتورة
 app.get('/api/orders/:id/invoice', async (req, res) => {
   if (!DB_ENABLED) return res.status(503).send('DB unavailable');
