@@ -223,6 +223,78 @@ app.get('/bosta-template.xlsx', (req, res) => {
   }
 });
 
+// ===== AI CHAT =====
+app.post('/api/ai/chat', async (req, res) => {
+  const { message, history, context } = req.body;
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY غير مضبوط' });
+  }
+  if (!message) return res.status(400).json({ error: 'رسالة فارغة' });
+
+  const systemPrompt = `أنت مساعد ذكي لنظام OrderPro الخاص بـ CAFELAX لإدارة التوصيل. تتحدث العربية العامية المصرية بشكل ودود ومختصر.
+
+مهامك:
+- تجاوب أسئلة عن الطلبات والمناديب والإحصائيات
+- تساعد في تحليل البيانات واقتراح تحسينات
+- تكتب رسائل للعملاء لما تطلب منك
+- تقترح حلول للمشاكل
+
+قواعد:
+- ردود مختصرة (2-4 جمل عادةً)
+- أرقام ومعلومات من البيانات الحقيقية فقط
+- لو مش عارف إجابة قول "مش متأكد"
+- استخدم emojis باعتدال
+- لا تخترع أرقام
+
+بيانات النظام الحالية:
+${JSON.stringify(context || {}, null, 2)}`;
+
+  try {
+    const payload = {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages: [
+        ...(history || []).slice(-6),
+        { role: 'user', content: message }
+      ]
+    };
+    const body = JSON.stringify(payload);
+    const result = await new Promise((resolve, reject) => {
+      const req2 = https.request({
+        hostname: 'api.anthropic.com',
+        path: '/v1/messages',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'Content-Length': Buffer.byteLength(body)
+        }
+      }, (r) => {
+        let data = '';
+        r.on('data', c => data += c);
+        r.on('end', () => {
+          try { resolve({ status: r.statusCode, data: JSON.parse(data) }); }
+          catch(e) { resolve({ status: r.statusCode, data: { error: data } }); }
+        });
+      });
+      req2.on('error', reject);
+      req2.write(body);
+      req2.end();
+    });
+    if (result.status !== 200) {
+      console.error('AI error:', result.data);
+      return res.status(500).json({ error: result.data?.error?.message || 'AI service error' });
+    }
+    const text = result.data.content?.[0]?.text || '';
+    res.json({ text, usage: result.data.usage });
+  } catch (e) {
+    console.error('AI chat error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ===== HELPER: map Shopify order =====
 function mapShopifyOrder(sh) {
   const shipping = sh.shipping_address || {};
