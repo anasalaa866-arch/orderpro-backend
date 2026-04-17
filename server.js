@@ -2,6 +2,8 @@ const express = require('express');
 const crypto = require('crypto');
 const cors = require('cors');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 const { Pool } = require('pg');
 const app = express();
 
@@ -208,6 +210,18 @@ async function initDB() {
 app.use(cors({ origin: '*' }));
 app.use('/webhook/shopify', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '10mb' }));
+
+// ===== SERVE BOSTA TEMPLATE =====
+app.get('/bosta-template.xlsx', (req, res) => {
+  const templatePath = path.join(__dirname, 'bosta-template.xlsx');
+  if (fs.existsSync(templatePath)) {
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.sendFile(templatePath);
+  } else {
+    res.status(404).json({ error: 'Template not found' });
+  }
+});
 
 // ===== HELPER: map Shopify order =====
 function mapShopifyOrder(sh) {
