@@ -1001,6 +1001,54 @@ app.post('/api/shopify/fetch-line-items', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+app.post('/api/shopify/price-check', async (req, res) => {
+  const { shopUrl, accessToken, shopifyOrderId } = req.body;
+  if (!shopUrl || !accessToken || !shopifyOrderId)
+    return res.status(400).json({ error: 'بيانات ناقصة' });
+  const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  try {
+    const r = await shopifyRequest(host, accessToken,
+      `/admin/api/2024-10/orders/${shopifyOrderId}.json`);
+    if (r.status !== 200) return res.status(r.status).json({ error: r.data });
+
+    const o = r.data.order;
+    const lineItemsSum = (o.line_items||[]).reduce((s,i)=>s + (parseFloat(i.price)||0)*(i.quantity||1), 0);
+    const shippingTotal = (o.shipping_lines||[]).reduce((s,l)=>s + (parseFloat(l.price)||0), 0);
+    const taxTotal = parseFloat(o.total_tax) || 0;
+    const discountTotal = parseFloat(o.total_discounts) || 0;
+
+    res.json({
+      orderName: o.name,
+      orderNumber: o.order_number,
+      currency: o.currency,
+      subtotalPrice: parseFloat(o.subtotal_price),
+      totalShipping: shippingTotal,
+      totalTax: taxTotal,
+      totalDiscounts: discountTotal,
+      totalPrice: parseFloat(o.total_price),
+      totalOutstanding: parseFloat(o.total_outstanding),
+      financialStatus: o.financial_status,
+      lineItemsSum,
+      lineItems: (o.line_items||[]).map(i=>({
+        name: i.name,
+        price: parseFloat(i.price)||0,
+        quantity: i.quantity,
+        total: (parseFloat(i.price)||0)*(i.quantity||1),
+        totalDiscount: parseFloat(i.total_discount)||0,
+      })),
+      shippingLines: (o.shipping_lines||[]).map(l=>({
+        title: l.title,
+        price: parseFloat(l.price)||0,
+      })),
+      taxLines: o.tax_lines || [],
+      discountApplications: o.discount_applications || [],
+      discountCodes: o.discount_codes || [],
+      note: o.note,
+      noteAttributes: o.note_attributes,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/shopify/diagnose', async (req, res) => {
   const { shopUrl, accessToken, shopifyOrderId } = req.body;
   if (!shopUrl || !accessToken || !shopifyOrderId)
