@@ -1203,15 +1203,17 @@ app.post('/api/shopify/diagnose', async (req, res) => {
 // ===== SHOPIFY ASSIGN: Fulfill + Tag =====
 app.post('/api/shopify/assign', async (req, res) => {
   let { shopUrl, accessToken, shopifyOrderId, courierName, orderId } = req.body;
+  let credsSource = 'body';
 
   // لو الفرونتند مبعتش credentials (مستخدم مش مدير)، جيبها من DB
   if (!shopUrl || !accessToken) {
     const creds = await getShopifyCredentials();
     shopUrl = shopUrl || creds.shopUrl;
     accessToken = accessToken || creds.accessToken;
+    credsSource = creds.fromDb ? 'database' : 'env';
   }
 
-  console.log('shopify/assign called:', { shopifyOrderId, courierName, orderId, hasCredsInBody: !!req.body.shopUrl });
+  console.log('shopify/assign called:', { orderId, shopifyOrderId, courierName, credsSource, tokenLen: accessToken?.length, tokenStart: accessToken?.slice(0,10) });
 
   if (!shopUrl || !accessToken || !shopifyOrderId) {
     return res.status(400).json({ success: false, error: 'بيانات ناقصة — الـ credentials مش محفوظة على السيرفر' });
@@ -1220,11 +1222,13 @@ app.post('/api/shopify/assign', async (req, res) => {
   const host = shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
   const errors = [];
   const logs = [];
+  logs.push(`creds from: ${credsSource}, host: ${host}, token: ${accessToken.slice(0,10)}... (${accessToken.length} chars)`);
 
   // ======= 1. إضافة Tag المندوب =======
   let tagSuccess = false;
   try {
     const getR = await shopifyRequest(host, accessToken, `/admin/api/2024-10/orders/${shopifyOrderId}.json?fields=id,tags`);
+    logs.push(`GET order HTTP ${getR.status}${getR.status !== 200 ? ' — body: ' + JSON.stringify(getR.data).slice(0,200) : ''}`);
     if (getR.status === 200 && getR.data.order) {
       const currentTags = (getR.data.order.tags || '').split(',').map(t=>t.trim()).filter(t=>t);
       if (!currentTags.includes(courierName)) {
@@ -1236,15 +1240,22 @@ app.post('/api/shopify/assign', async (req, res) => {
           tagSuccess = true;
           logs.push(`✅ Tag added: ${courierName}`);
         } else {
-          logs.push(`⚠️ Tag failed HTTP ${tagR.status}`);
+          logs.push(`⚠️ Tag PUT failed HTTP ${tagR.status} — ${JSON.stringify(tagR.data).slice(0,200)}`);
           if(tagR.status === 403) errors.push('Token needs write_orders scope for tags');
         }
       } else {
         tagSuccess = true;
         logs.push('✅ Tag already exists');
       }
+    } else if (getR.status === 401) {
+      errors.push('Shopify 401 Unauthorized — الـ Access Token غير صالح أو منتهي');
+      logs.push('❌ HTTP 401 — token invalid');
+    } else if (getR.status === 404) {
+      errors.push('الطلب مش موجود في Shopify (ID: ' + shopifyOrderId + ')');
+    } else {
+      errors.push(`Shopify GET failed HTTP ${getR.status}`);
     }
-  } catch (e) { logs.push('Tag error: ' + e.message); }
+  } catch (e) { logs.push('Tag error: ' + e.message); errors.push('Tag exception: ' + e.message); }
 
   // ======= 2. Fulfillment Strategy =======
   let fulfilled = false;
@@ -1375,14 +1386,15 @@ async function getShopifyCredentials() {
       const map = {};
       rows.forEach(r => map[r.key] = r.value);
       if (map.shopify_url && map.shopify_token) {
-        return { shopUrl: map.shopify_url, accessToken: map.shopify_token };
+        return { shopUrl: map.shopify_url, accessToken: map.shopify_token, fromDb: true };
       }
     } catch(e) {}
   }
   // fallback env
   return {
     shopUrl: process.env.SHOPIFY_SHOP_URL || '',
-    accessToken: process.env.SHOPIFY_ACCESS_TOKEN || ''
+    accessToken: process.env.SHOPIFY_ACCESS_TOKEN || '',
+    fromDb: false
   };
 }
 
@@ -1606,9 +1618,55 @@ app.get('/api/settings', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT key, value FROM app_settings');
     const settings = {};
-    rows.forEach(r => settings[r.key] = r.value);
+    rows.forEach(r => {
+      // خبي الـ token في الرد (أرجع أول 10 حروف + طول الـ token)
+      if (key_is_token(r.key)) {
+        settings[r.key] = r.value ? r.value.slice(0,10) + '...' + ` (${r.value.length} chars)` : '';
+      } else {
+        settings[r.key] = r.value;
+      }
+    });
     res.json(settings);
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+function key_is_token(k){ return /token|password|secret|key/i.test(k); }
+
+// GET /api/shopify/test — يختبر إذا كانت الـ credentials شغالة
+app.get('/api/shopify/test', async (req, res) => {
+  try {
+    const creds = await getShopifyCredentials();
+    if (!creds.shopUrl || !creds.accessToken) {
+      return res.json({ 
+        ok: false, 
+        reason: 'no_credentials',
+        message: 'الـ credentials مش محفوظة في السيرفر',
+        source: 'none'
+      });
+    }
+    const host = creds.shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    const r = await shopifyRequest(host, creds.accessToken, `/admin/api/2024-10/shop.json`);
+    if (r.status === 200 && r.data.shop) {
+      return res.json({
+        ok: true,
+        source: creds.fromDb ? 'database' : 'env',
+        shopName: r.data.shop.name,
+        shopEmail: r.data.shop.email,
+        plan: r.data.shop.plan_name,
+        host
+      });
+    }
+    return res.json({
+      ok: false,
+      reason: 'auth_failed',
+      status: r.status,
+      response: JSON.stringify(r.data).slice(0,200),
+      message: r.status === 401 ? 'الـ Token غير صالح أو منتهي' : 'فشل في الاتصال',
+      host
+    });
+  } catch(e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // POST /api/settings → يحفظ مفتاح واحد أو أكتر
