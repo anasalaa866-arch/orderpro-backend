@@ -170,6 +170,9 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_bosta BOOLEAN DEFAULT false",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS has_problem BOOLEAN DEFAULT false",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS assigned_zone TEXT",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS zone_manually_set BOOLEAN DEFAULT false",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS order_note TEXT DEFAULT ''",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_note TEXT DEFAULT ''",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS bosta_awb_url TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS bosta_awb_base64 TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shop_settled BOOLEAN DEFAULT false",
@@ -341,6 +344,10 @@ function mapShopifyOrder(sh) {
     shipping_method: shippingLine.title || '',
     delivery_type: isTransitOrder ? 'transit' : isPickupOrder ? 'pickup' : isSameDay ? 'express' : 'normal',
     note: sh.note || '',
+    // customer_note: ملاحظة العميل الأصلية من Shopify (read-only، تفضل زي ما هي)
+    customer_note: sh.note || '',
+    // order_note: ملاحظة داخلية — نسخ من Shopify أول مرة، الموظف يقدر يعدلها
+    order_note: sh.note || '',
     items: (sh.line_items || []).map(i => i.name + ' x' + i.quantity).join(', '),
     line_items_json: JSON.stringify((sh.line_items || []).map(i => ({
       name: i.name,
@@ -374,6 +381,9 @@ function rowToOrder(r) {
     bostaAwbUrl: r.bosta_awb_url, bostaAwbBase64: r.bosta_awb_base64,
     bostaStatus: r.bosta_status, hasProblem: r.has_problem || false,
     assignedZone: r.assigned_zone || null,
+    zoneManuallySet: r.zone_manually_set || false,
+    orderNote: r.order_note || '',
+    customerNote: r.customer_note || '',
     bostaExported: r.bosta_exported || false,
     bostaExportedAt: r.bosta_exported_at || null,
     lineItemsJson: r.line_items_json || null,
@@ -433,8 +443,8 @@ app.post('/webhook/shopify', async (req, res) => {
   try {
     if (DB_ENABLED) {
       await pool.query(`
-        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,addr2,total,subtotal_price,shipping_price,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,line_items_json,source_name,time,created_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+        INSERT INTO orders (id,shopify_id,src,name,phone,area,addr,addr2,total,subtotal_price,shipping_price,ship,courier_id,status,paid,shipping_method,delivery_type,note,items,line_items_json,source_name,time,created_at,customer_note,order_note)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
         ON CONFLICT (id) DO UPDATE SET
           name=EXCLUDED.name, phone=EXCLUDED.phone, area=EXCLUDED.area,
           addr=EXCLUDED.addr, addr2=EXCLUDED.addr2, total=EXCLUDED.total,
@@ -443,6 +453,12 @@ app.post('/webhook/shopify', async (req, res) => {
           paid=EXCLUDED.paid, shipping_method=EXCLUDED.shipping_method,
           delivery_type=EXCLUDED.delivery_type, note=EXCLUDED.note,
           items=EXCLUDED.items, line_items_json=EXCLUDED.line_items_json,
+          customer_note=EXCLUDED.customer_note,
+          -- order_note: نحفظ اللي موجود لو الموظف عدل عليه، وإلا نحط اللي من Shopify
+          order_note=CASE
+            WHEN orders.order_note IS NOT NULL AND orders.order_note <> '' AND orders.order_note <> orders.customer_note THEN orders.order_note
+            ELSE EXCLUDED.order_note
+          END,
           updated_at=NOW(),
           -- حدّث status بس لو الطلب ملغي على Shopify، أو لو لسه مش موزع
           status=CASE
@@ -453,7 +469,8 @@ app.post('/webhook/shopify', async (req, res) => {
       `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.addr2||'', o.total,
           o.subtotal_price||0, o.shipping_price||0, o.ship,
           o.courier_id, o.status, o.paid, o.shipping_method, o.delivery_type,
-          o.note, o.items, o.line_items_json, o.source_name||'', o.time, o.created_at]);
+          o.note, o.items, o.line_items_json, o.source_name||'', o.time, o.created_at,
+          o.customer_note || '', o.order_note || '']);
     } else {
       const idx = memOrders.findIndex(x=>x.id===o.id);
       if (idx<0) memOrders.unshift({...o, shopifyId:o.shopify_id, courierId:null});
@@ -552,6 +569,9 @@ app.patch('/api/orders/:id', async (req, res) => {
     bostaStatus:'bosta_status', deliveryType:'delivery_type',
     hasProblem:'has_problem',
     assignedZone:'assigned_zone',
+    zoneManuallySet:'zone_manually_set',
+    orderNote:'order_note',
+    customerNote:'customer_note',
     bostaExported:'bosta_exported',
     bostaExportedAt:'bosta_exported_at',
     name:'name', phone:'phone', area:'area', addr:'addr',
