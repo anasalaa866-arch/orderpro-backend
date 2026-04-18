@@ -211,6 +211,14 @@ async function initDB() {
         value TEXT,
         updated_at TIMESTAMPTZ DEFAULT NOW()
       )`,
+      `CREATE TABLE IF NOT EXISTS batches (
+        code TEXT PRIMARY KEY,
+        batch_date TEXT NOT NULL,
+        status TEXT DEFAULT 'open',
+        started_at TIMESTAMPTZ DEFAULT NOW(),
+        closed_at TIMESTAMPTZ,
+        order_count INTEGER DEFAULT 0
+      )`,
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); } catch(e) {}
@@ -1689,6 +1697,77 @@ app.post('/api/settings', async (req, res) => {
     res.json({ ok: true, saved: keys.length });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+// ===== BATCHES ENDPOINTS =====
+// GET /api/batches → كل الدفعات (أحدث أولاً)
+app.get('/api/batches', async (req, res) => {
+  if (!DB_ENABLED) return res.json([]);
+  try {
+    const { rows } = await pool.query(
+      'SELECT code, batch_date, status, started_at, closed_at, order_count FROM batches ORDER BY started_at DESC LIMIT 200'
+    );
+    res.json(rows.map(r => ({
+      code: r.code,
+      date: r.batch_date,
+      status: r.status,
+      startedAt: r.started_at,
+      closedAt: r.closed_at,
+      orderCount: r.order_count || 0
+    })));
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/batches/current → الدفعة المفتوحة حالياً (آخر واحدة status=open)
+app.get('/api/batches/current', async (req, res) => {
+  if (!DB_ENABLED) return res.json(null);
+  try {
+    const { rows } = await pool.query(
+      "SELECT code, batch_date, status, started_at FROM batches WHERE status='open' ORDER BY started_at DESC LIMIT 1"
+    );
+    if (!rows.length) return res.json(null);
+    const r = rows[0];
+    res.json({
+      code: r.code,
+      date: r.batch_date,
+      status: r.status,
+      startedAt: r.started_at
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/batches → أنشئ دفعة جديدة
+app.post('/api/batches', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  try {
+    const { code, date, status, startedAt } = req.body || {};
+    if (!code || !date) return res.status(400).json({ error: 'code and date required' });
+    await pool.query(`
+      INSERT INTO batches (code, batch_date, status, started_at)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (code) DO NOTHING
+    `, [code, date, status || 'open', startedAt || new Date().toISOString()]);
+    res.json({ ok: true, code });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/batches/:code → حدّث الدفعة (إقفال، تعديل عدد الطلبات)
+app.patch('/api/batches/:code', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  try {
+    const { status, closedAt, orderCount } = req.body || {};
+    const sets = [];
+    const vals = [];
+    let i = 1;
+    if (status !== undefined) { sets.push(`status=$${i++}`); vals.push(status); }
+    if (closedAt !== undefined) { sets.push(`closed_at=$${i++}`); vals.push(closedAt); }
+    if (orderCount !== undefined) { sets.push(`order_count=$${i++}`); vals.push(orderCount); }
+    if (!sets.length) return res.status(400).json({ error: 'no fields' });
+    vals.push(req.params.code);
+    await pool.query(`UPDATE batches SET ${sets.join(', ')} WHERE code=$${i}`, vals);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 
 // ===== INVOICE CACHE ENDPOINTS =====
 // GET /api/orders/:id/invoice → يرجع الـ HTML جاهز للفاتورة
