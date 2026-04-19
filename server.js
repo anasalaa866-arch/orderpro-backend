@@ -219,6 +219,53 @@ async function initDB() {
         closed_at TIMESTAMPTZ,
         order_count INTEGER DEFAULT 0
       )`,
+
+      // ===== CAFELAX STARS (Courier App) Schema =====
+      "ALTER TABLE couriers ADD COLUMN IF NOT EXISTS username TEXT UNIQUE",
+      "ALTER TABLE couriers ADD COLUMN IF NOT EXISTS password_hash TEXT",
+      "ALTER TABLE couriers ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ",
+
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS courier_delivered_at TIMESTAMPTZ",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS courier_note TEXT DEFAULT ''",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS undeliverable_reason TEXT",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_change_requested BOOLEAN DEFAULT false",
+
+      // طلبات المراجعة (تحويل COD لمدفوع، تسويات، إلخ)
+      `CREATE TABLE IF NOT EXISTS pending_reviews (
+        id SERIAL PRIMARY KEY,
+        order_id TEXT,
+        courier_id INTEGER,
+        type TEXT NOT NULL,
+        data JSONB DEFAULT '{}'::jsonb,
+        status TEXT DEFAULT 'pending',
+        reviewed_by INTEGER,
+        reviewed_at TIMESTAMPTZ,
+        rejection_reason TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
+      "CREATE INDEX IF NOT EXISTS idx_pending_reviews_status ON pending_reviews(status)",
+      "CREATE INDEX IF NOT EXISTS idx_pending_reviews_courier ON pending_reviews(courier_id)",
+
+      // تسويات المندوب اليومية (قبل الاعتماد من المحاسب)
+      `CREATE TABLE IF NOT EXISTS courier_adjustments (
+        id SERIAL PRIMARY KEY,
+        courier_id INTEGER NOT NULL,
+        amount NUMERIC NOT NULL,
+        reason TEXT,
+        proof_image_base64 TEXT,
+        status TEXT DEFAULT 'pending',
+        reviewed_by INTEGER,
+        reviewed_at TIMESTAMPTZ,
+        rejection_reason TEXT,
+        settlement_id INTEGER,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
+      "CREATE INDEX IF NOT EXISTS idx_courier_adjustments_courier ON courier_adjustments(courier_id)",
+      "CREATE INDEX IF NOT EXISTS idx_courier_adjustments_status ON courier_adjustments(status)",
+
+      // صلاحية محاسبة المناديب (للمستخدمين)
+      "ALTER TABLE users ADD COLUMN IF NOT EXISTS can_settle_couriers BOOLEAN DEFAULT false",
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); } catch(e) {}
@@ -1412,14 +1459,20 @@ function fetchImageAsBase64(imageUrl) {
     try {
       const url = new URL(imageUrl);
       const mod = url.protocol === 'https:' ? require('https') : require('http');
-      const req = mod.get(imageUrl, { timeout: 8000 }, (res) => {
+      // timeout 15 ثانية — Shopify CDN ساعات بيكون بطيء
+      const req = mod.get(imageUrl, { timeout: 15000 }, (res) => {
         if (res.statusCode !== 200) { res.resume(); return resolve(null); }
         const chunks = [];
-        res.on('data', (c) => chunks.push(c));
+        let totalSize = 0;
+        res.on('data', (c) => {
+          totalSize += c.length;
+          // لو الصورة كبيرة جداً (>1.5MB)، ألغي عشان ما نملأش الـ DB
+          if (totalSize > 1500 * 1024) { req.destroy(); return resolve(null); }
+          chunks.push(c);
+        });
         res.on('end', () => {
           try {
             const buf = Buffer.concat(chunks);
-            if (buf.length > 500 * 1024) return resolve(null); // اقل من 500KB
             const mime = res.headers['content-type'] || 'image/jpeg';
             resolve('data:' + mime + ';base64,' + buf.toString('base64'));
           } catch(e) { resolve(null); }
@@ -1467,10 +1520,21 @@ async function generateInvoiceHtml(order, couriersArr) {
   }
   if (!lineItems.length) lineItems = [{name: order.details || '—', quantity: 1, price: order.total || 0, totalPrice: order.total || 0}];
 
-  // حوّل الصور لـ base64 (مع تحديد وقت max 30 ثانية إجمالاً)
-  const imagePromises = lineItems.map(i => i.image ? fetchImageAsBase64(i.image) : Promise.resolve(null));
+  // حوّل الصور لـ base64 (مع تحديد وقت max 12 ثانية للصورة الواحدة)
+  const imagePromises = lineItems.map(i => {
+    if (!i.image) return Promise.resolve(null);
+    // لو الصورة مش URL صحيح أو بالفعل data:، سيبها زي ما هي
+    if (typeof i.image !== 'string' || !i.image.startsWith('http')) return Promise.resolve(i.image);
+    return fetchImageAsBase64(i.image);
+  });
   const base64Images = await Promise.all(imagePromises);
-  lineItems.forEach((i, idx) => { if (base64Images[idx]) i.image = base64Images[idx]; else if (!base64Images[idx] && i.image) i.image = null; });
+  lineItems.forEach((i, idx) => {
+    if (base64Images[idx]) {
+      i.image = base64Images[idx];
+    }
+    // لو الـ fetch فشل، نحتفظ بـ i.image الأصلي (URL) بدل ما نخليها null
+    // عشان المتصفح يحاول يحمل الصورة وقت الطباعة
+  });
 
   // بيانات العنوان بدون تكرار
   const addrParts = [];
@@ -1808,23 +1872,51 @@ app.post('/api/orders/:id/invoice/refresh', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/invoices/batch-generate → يولّد عدة فواتير مرة واحدة
+// POST /api/invoices/batch-generate → يولّد عدة فواتير مرة واحدة (بالـ parallel)
 app.post('/api/invoices/batch-generate', async (req, res) => {
   const { orderIds } = req.body;
   if (!Array.isArray(orderIds) || !orderIds.length) return res.status(400).json({ error: 'orderIds مطلوبة' });
+
+  const CONCURRENCY = 5; // معالجة 5 فواتير في نفس الوقت
   let generated = 0, cached = 0, failed = 0;
+  const startTs = Date.now();
+
+  // فلتر أولاً الطلبات اللي عندها cache صالح
+  const needsGen = [];
   for (const id of orderIds) {
     try {
       const r = await pool.query(
         'SELECT 1 FROM invoice_cache WHERE order_id=$1 AND expires_at > NOW()',
         [id]
       );
-      if (r.rows.length) { cached++; continue; }
-      await cacheInvoiceForOrder(id);
-      generated++;
+      if (r.rows.length) { cached++; }
+      else needsGen.push(id);
     } catch(e) { failed++; }
   }
-  res.json({ total: orderIds.length, generated, cached, failed });
+
+  console.log(`batch-generate: ${orderIds.length} total, ${cached} cached, ${needsGen.length} need generation`);
+
+  // عالج الـ orders الناقصة في مجموعات متوازية
+  const runOne = async (id) => {
+    try {
+      await cacheInvoiceForOrder(id);
+      generated++;
+    } catch(e) {
+      console.warn('batch-generate failed for', id, ':', e.message);
+      failed++;
+    }
+  };
+
+  // نفّذ بـ chunks
+  for (let i = 0; i < needsGen.length; i += CONCURRENCY) {
+    const chunk = needsGen.slice(i, i + CONCURRENCY);
+    await Promise.all(chunk.map(runOne));
+  }
+
+  const took = ((Date.now() - startTs) / 1000).toFixed(1);
+  console.log(`batch-generate done in ${took}s: ${generated} generated, ${cached} cached, ${failed} failed`);
+
+  res.json({ total: orderIds.length, generated, cached, failed, tookSec: parseFloat(took) });
 });
 
 async function enrichLineItemsWithImages(lineItems, host, accessToken) {
@@ -2270,6 +2362,629 @@ app.post('/api/login', async (req, res) => {
     }
   }catch(e){ res.status(500).json({error:e.message}); }
 });
+
+// ============================================================
+// ===== CAFELAX STARS — Courier Mobile App Endpoints =====
+// ============================================================
+
+// Simple courier session tokens (in-memory, 24h TTL)
+const _courierSessions = new Map(); // token -> {courierId, expires}
+
+function _generateToken(){
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function _cleanupExpiredSessions(){
+  const now = Date.now();
+  for(const [token, session] of _courierSessions.entries()){
+    if(session.expires < now) _courierSessions.delete(token);
+  }
+}
+setInterval(_cleanupExpiredSessions, 60 * 60 * 1000); // every hour
+
+// Middleware: validates courier token
+function courierAuth(req, res, next){
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if(!token) return res.status(401).json({error: 'No token'});
+
+  const session = _courierSessions.get(token);
+  if(!session) return res.status(401).json({error: 'Invalid or expired token'});
+
+  if(session.expires < Date.now()){
+    _courierSessions.delete(token);
+    return res.status(401).json({error: 'Session expired'});
+  }
+
+  req.courierId = session.courierId;
+  next();
+}
+
+// POST /api/courier/login — login بـ username + password hash
+app.post('/api/courier/login', async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error: 'DB unavailable'});
+  const {username, passHash} = req.body || {};
+  if(!username || !passHash) return res.status(400).json({error: 'username و password مطلوبين'});
+
+  try{
+    const r = await pool.query(
+      `SELECT id, name, phone, zone, username FROM couriers
+       WHERE username=$1 AND password_hash=$2 AND (status IS NULL OR status != 'غير نشط')`,
+      [username, passHash]
+    );
+    if(!r.rows.length) return res.json({success: false, error: 'خطأ في اسم المستخدم أو كلمة المرور'});
+
+    const courier = r.rows[0];
+    const token = _generateToken();
+    const expires = Date.now() + 24 * 60 * 60 * 1000; // 24h
+    _courierSessions.set(token, {courierId: courier.id, expires});
+
+    // سجل آخر دخول
+    await pool.query('UPDATE couriers SET last_login_at=NOW() WHERE id=$1', [courier.id]).catch(()=>{});
+
+    res.json({
+      success: true,
+      token,
+      courier: {
+        id: courier.id,
+        name: courier.name,
+        phone: courier.phone,
+        zone: courier.zone,
+        username: courier.username
+      }
+    });
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/courier/me — معلومات المندوب الحالي
+app.get('/api/courier/me', courierAuth, async (req, res) => {
+  try{
+    const r = await pool.query(
+      'SELECT id, name, phone, zone, username FROM couriers WHERE id=$1',
+      [req.courierId]
+    );
+    if(!r.rows.length) return res.status(404).json({error: 'Courier not found'});
+    res.json(r.rows[0]);
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/courier/my-orders — كل طلبات المندوب مقسمة حسب الحالة
+app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
+  try{
+    const r = await pool.query(
+      `SELECT * FROM orders
+       WHERE courier_id=$1
+         AND status IN ('جاري التوصيل', 'جديد')
+         AND (merged_into IS NULL OR merged_into = '')
+       ORDER BY picked_up_at ASC NULLS LAST, created_at ASC`,
+      [req.courierId]
+    );
+
+    // تقسيم الطلبات:
+    // - "معاه" (with_me): اللي picked_up_at مش null (المحاسب طبع له ورقة توصيل)
+    // - "جديدة" (new): اللي picked_up_at null (لسه في المحل)
+    const withMe = [];
+    const newOrders = [];
+    const completed = [];
+
+    r.rows.forEach(o => {
+      const mapped = _mapOrderForCourier(o);
+      if(o.status === 'جاري التوصيل' && o.picked_up_at){
+        withMe.push(mapped);
+      } else if(o.status === 'جاري التوصيل' && !o.picked_up_at){
+        newOrders.push(mapped);
+      }
+    });
+
+    // كمان الطلبات اللي سلمها النهاردة (للمراجعة)
+    const todayR = await pool.query(
+      `SELECT * FROM orders
+       WHERE courier_id=$1
+         AND courier_delivered_at IS NOT NULL
+         AND courier_delivered_at::date = CURRENT_DATE
+       ORDER BY courier_delivered_at DESC`,
+      [req.courierId]
+    );
+    todayR.rows.forEach(o => completed.push(_mapOrderForCourier(o)));
+
+    res.json({withMe, newOrders, completed});
+  }catch(e){ console.error('my-orders:', e); res.status(500).json({error: e.message}); }
+});
+
+// Helper: ترجمة صف الطلب للشكل المناسب لتطبيق المندوب
+function _mapOrderForCourier(r){
+  return {
+    id: r.id,
+    name: r.name,
+    phone: r.phone,
+    area: r.area,
+    addr: r.addr,
+    addr2: r.addr2,
+    total: parseFloat(r.total) || 0,
+    ship: parseFloat(r.ship) || 0,
+    paid: r.paid,
+    status: r.status,
+    deliveryType: r.delivery_type,
+    assignedZone: r.assigned_zone,
+    batchCode: r.batch_code,
+    orderNote: r.order_note || '',
+    customerNote: r.customer_note || '',
+    courierNote: r.courier_note || '',
+    items: r.items,
+    pickedUpAt: r.picked_up_at,
+    deliveredAt: r.courier_delivered_at,
+    undeliverableReason: r.undeliverable_reason,
+    paymentChangeRequested: r.payment_change_requested || false,
+    createdAt: r.created_at,
+    // للعرض فقط، مش للـ fulfillment
+    shopifyId: r.shopify_id,
+    src: r.src,
+  };
+}
+
+// POST /api/courier/orders/:id/deliver — تم التسليم
+// body: {collectedCash: boolean} — هل حصّل فلوس؟ (للـ COD)
+app.post('/api/courier/orders/:id/deliver', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  try{
+    // تحقق إن الطلب فعلاً للمندوب ده
+    const chk = await pool.query('SELECT courier_id, status, paid FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(String(o.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+    if(o.status !== 'جاري التوصيل'){
+      return res.status(400).json({error: 'الطلب لا يمكن تسليمه في حالته الحالية'});
+    }
+
+    // ✓ تم التسليم → status = 'تحت التسوية'
+    await pool.query(
+      `UPDATE orders SET
+        status='تحت التسوية',
+        courier_delivered_at=NOW(),
+        updated_at=NOW()
+       WHERE id=$1`,
+      [id]
+    );
+
+    // log history
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'courier_delivered', $2, 'delivered')`,
+      [id, 'Courier #' + req.courierId]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier/orders/:id/undeliverable — لم يتم التسليم
+// body: {reason: string}
+app.post('/api/courier/orders/:id/undeliverable', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  const {reason} = req.body || {};
+  if(!reason) return res.status(400).json({error: 'السبب مطلوب'});
+
+  try{
+    const chk = await pool.query('SELECT courier_id, status FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(String(o.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+
+    await pool.query(
+      `UPDATE orders SET
+        undeliverable_reason=$2,
+        updated_at=NOW()
+       WHERE id=$1`,
+      [id, reason]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'undeliverable', $2, $3)`,
+      [id, 'Courier #' + req.courierId, reason]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier/orders/:id/note — إضافة/تعديل ملاحظة المندوب
+// body: {note: string}
+app.post('/api/courier/orders/:id/note', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  const {note} = req.body || {};
+  try{
+    const chk = await pool.query('SELECT courier_id FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    if(String(chk.rows[0].courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+
+    await pool.query(
+      `UPDATE orders SET courier_note=$2, updated_at=NOW() WHERE id=$1`,
+      [id, note || '']
+    );
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier/orders/:id/request-payment-change
+// طلب تحويل الطلب من COD لمدفوع (مع صورة دليل)
+// body: {proofImageBase64: string, note: string}
+app.post('/api/courier/orders/:id/request-payment-change', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  const {proofImageBase64, note} = req.body || {};
+  if(!proofImageBase64) return res.status(400).json({error: 'صورة الدليل مطلوبة'});
+  // حد أقصى 5MB للـ base64
+  if(proofImageBase64.length > 5 * 1024 * 1024 * 1.4){
+    return res.status(400).json({error: 'الصورة كبيرة جداً (الحد الأقصى 5MB)'});
+  }
+
+  try{
+    const chk = await pool.query('SELECT courier_id, paid, status FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(String(o.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+    if(o.paid){
+      return res.status(400).json({error: 'الطلب مدفوع بالفعل'});
+    }
+
+    // أنشئ طلب مراجعة
+    await pool.query(
+      `INSERT INTO pending_reviews (order_id, courier_id, type, data, status)
+       VALUES ($1, $2, 'payment_change', $3, 'pending')`,
+      [id, req.courierId, JSON.stringify({proofImageBase64, note: note || ''})]
+    );
+
+    // علّم الطلب
+    await pool.query(
+      `UPDATE orders SET payment_change_requested=true, updated_at=NOW() WHERE id=$1`,
+      [id]
+    );
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier/adjustments — يضيف تسوية إضافية
+// body: {amount: number, reason: string, proofImageBase64?: string}
+app.post('/api/courier/adjustments', courierAuth, async (req, res) => {
+  const {amount, reason, proofImageBase64} = req.body || {};
+  if(amount === undefined || amount === null) return res.status(400).json({error: 'المبلغ مطلوب'});
+  if(!reason || !reason.trim()) return res.status(400).json({error: 'السبب مطلوب'});
+
+  try{
+    const r = await pool.query(
+      `INSERT INTO courier_adjustments (courier_id, amount, reason, proof_image_base64, status)
+       VALUES ($1, $2, $3, $4, 'pending')
+       RETURNING id, created_at`,
+      [req.courierId, parseFloat(amount), reason.trim(), proofImageBase64 || null]
+    );
+    res.json({success: true, id: r.rows[0].id, createdAt: r.rows[0].created_at});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/courier/adjustments — قائمة تسويات المندوب الحالية (pending فقط)
+app.get('/api/courier/adjustments', courierAuth, async (req, res) => {
+  try{
+    const r = await pool.query(
+      `SELECT id, amount, reason, status, rejection_reason, created_at,
+              CASE WHEN proof_image_base64 IS NOT NULL THEN true ELSE false END as has_proof
+       FROM courier_adjustments
+       WHERE courier_id=$1 AND settlement_id IS NULL
+       ORDER BY created_at DESC`,
+      [req.courierId]
+    );
+    res.json(r.rows.map(a => ({
+      id: a.id,
+      amount: parseFloat(a.amount),
+      reason: a.reason,
+      status: a.status,
+      rejectionReason: a.rejection_reason,
+      createdAt: a.created_at,
+      hasProof: a.has_proof
+    })));
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// DELETE /api/courier/adjustments/:id — حذف تسوية (لو لسه pending)
+app.delete('/api/courier/adjustments/:id', courierAuth, async (req, res) => {
+  try{
+    const r = await pool.query(
+      `DELETE FROM courier_adjustments
+       WHERE id=$1 AND courier_id=$2 AND status='pending' AND settlement_id IS NULL
+       RETURNING id`,
+      [req.params.id, req.courierId]
+    );
+    if(!r.rows.length) return res.status(404).json({error: 'لا يمكن حذف هذه التسوية'});
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/courier/my-statement — كشف الحساب (الطلبات المسلمة + التسويات)
+app.get('/api/courier/my-statement', courierAuth, async (req, res) => {
+  try{
+    // الطلبات تحت التسوية (اللي المندوب سلمها ولسه ما اتسوّتش)
+    const ordersR = await pool.query(
+      `SELECT id, name, total, ship, paid, courier_delivered_at, delivery_type
+       FROM orders
+       WHERE courier_id=$1
+         AND status='تحت التسوية'
+         AND (merged_into IS NULL OR merged_into = '')
+       ORDER BY courier_delivered_at DESC`,
+      [req.courierId]
+    );
+
+    const orders = ordersR.rows.map(o => ({
+      id: o.id,
+      name: o.name,
+      total: parseFloat(o.total) || 0,
+      ship: parseFloat(o.ship) || 0,
+      paid: o.paid,
+      deliveredAt: o.courier_delivered_at,
+      deliveryType: o.delivery_type
+    }));
+
+    const totalCod = orders.filter(o => !o.paid).reduce((s, o) => s + o.total, 0);
+    const totalShip = orders.reduce((s, o) => s + o.ship, 0);
+
+    // التسويات الإضافية
+    const adjR = await pool.query(
+      `SELECT id, amount, reason, status, created_at
+       FROM courier_adjustments
+       WHERE courier_id=$1 AND settlement_id IS NULL
+       ORDER BY created_at DESC`,
+      [req.courierId]
+    );
+    const adjustments = adjR.rows.map(a => ({
+      id: a.id,
+      amount: parseFloat(a.amount),
+      reason: a.reason,
+      status: a.status,
+      createdAt: a.created_at
+    }));
+
+    // احسب التسويات المعتمدة فقط
+    const approvedAdjTotal = adjustments
+      .filter(a => a.status === 'approved')
+      .reduce((s, a) => s + a.amount, 0);
+
+    // صافي الحساب: COD - الشحن + التسويات المعتمدة
+    const net = totalCod - totalShip + approvedAdjTotal;
+
+    res.json({
+      orders,
+      adjustments,
+      summary: {
+        orderCount: orders.length,
+        totalCod,
+        totalShip,
+        approvedAdjTotal,
+        netAmount: net
+      }
+    });
+  }catch(e){ console.error('my-statement:', e); res.status(500).json({error: e.message}); }
+});
+
+// ====== ADMIN/ACCOUNTANT ENDPOINTS ======
+
+// POST /api/couriers/:id/mark-picked-up
+// لما المحاسب يطبع ورقة توصيل، بنعلم الطلبات إنها اتسلمت للمندوب
+// body: {orderIds: string[]}
+app.post('/api/couriers/:id/mark-picked-up', async (req, res) => {
+  const {orderIds} = req.body || {};
+  if(!Array.isArray(orderIds) || !orderIds.length){
+    return res.status(400).json({error: 'orderIds مطلوبة'});
+  }
+  try{
+    await pool.query(
+      `UPDATE orders SET picked_up_at=NOW(), updated_at=NOW()
+       WHERE courier_id=$1 AND id = ANY($2::text[]) AND picked_up_at IS NULL`,
+      [req.params.id, orderIds]
+    );
+    res.json({success: true, count: orderIds.length});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/couriers/:id/set-credentials — الأدمن يحدد username/password للمندوب
+// body: {username, passHash}
+app.post('/api/couriers/:id/set-credentials', async (req, res) => {
+  const {username, passHash} = req.body || {};
+  if(!username || !passHash) return res.status(400).json({error: 'username و password مطلوبين'});
+  try{
+    // تحقق إن الـ username مش مستخدم لمندوب آخر
+    const conflict = await pool.query(
+      'SELECT id FROM couriers WHERE username=$1 AND id != $2',
+      [username, req.params.id]
+    );
+    if(conflict.rows.length){
+      return res.status(400).json({error: 'اسم المستخدم مستخدم بالفعل لمندوب آخر'});
+    }
+
+    await pool.query(
+      'UPDATE couriers SET username=$1, password_hash=$2 WHERE id=$3',
+      [username, passHash, req.params.id]
+    );
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/pending-reviews — المراجعات المعلقة (للمحاسب)
+app.get('/api/pending-reviews', async (req, res) => {
+  try{
+    const r = await pool.query(
+      `SELECT pr.id, pr.order_id, pr.courier_id, pr.type, pr.data, pr.status,
+              pr.created_at, c.name as courier_name,
+              o.name as customer_name, o.total, o.paid
+       FROM pending_reviews pr
+       LEFT JOIN couriers c ON c.id = pr.courier_id
+       LEFT JOIN orders o ON o.id = pr.order_id
+       WHERE pr.status='pending'
+       ORDER BY pr.created_at ASC`
+    );
+    res.json(r.rows.map(row => ({
+      id: row.id,
+      orderId: row.order_id,
+      courierId: row.courier_id,
+      courierName: row.courier_name,
+      customerName: row.customer_name,
+      orderTotal: parseFloat(row.total) || 0,
+      orderPaid: row.paid,
+      type: row.type,
+      data: row.data,
+      status: row.status,
+      createdAt: row.created_at
+    })));
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/pending-reviews/:id/approve
+app.post('/api/pending-reviews/:id/approve', async (req, res) => {
+  const {reviewedBy} = req.body || {};
+  try{
+    const r = await pool.query(
+      `SELECT * FROM pending_reviews WHERE id=$1 AND status='pending'`,
+      [req.params.id]
+    );
+    if(!r.rows.length) return res.status(404).json({error: 'المراجعة غير موجودة أو تمت'});
+    const pr = r.rows[0];
+
+    // طبّق الإجراء بناءً على النوع
+    if(pr.type === 'payment_change'){
+      // حوّل الطلب لـ paid=true
+      await pool.query(
+        'UPDATE orders SET paid=true, payment_change_requested=false, updated_at=NOW() WHERE id=$1',
+        [pr.order_id]
+      );
+    }
+
+    await pool.query(
+      `UPDATE pending_reviews SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,
+      [reviewedBy || null, req.params.id]
+    );
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/pending-reviews/:id/reject
+app.post('/api/pending-reviews/:id/reject', async (req, res) => {
+  const {reviewedBy, reason} = req.body || {};
+  try{
+    const r = await pool.query(
+      `SELECT * FROM pending_reviews WHERE id=$1 AND status='pending'`,
+      [req.params.id]
+    );
+    if(!r.rows.length) return res.status(404).json({error: 'المراجعة غير موجودة أو تمت'});
+    const pr = r.rows[0];
+
+    if(pr.type === 'payment_change'){
+      await pool.query(
+        'UPDATE orders SET payment_change_requested=false, updated_at=NOW() WHERE id=$1',
+        [pr.order_id]
+      );
+    }
+
+    await pool.query(
+      `UPDATE pending_reviews SET status='rejected', reviewed_by=$1, reviewed_at=NOW(),
+       rejection_reason=$2 WHERE id=$3`,
+      [reviewedBy || null, reason || '', req.params.id]
+    );
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/pending-reviews/:id/proof — جيب صورة الدليل
+app.get('/api/pending-reviews/:id/proof', async (req, res) => {
+  try{
+    const r = await pool.query(
+      'SELECT data FROM pending_reviews WHERE id=$1',
+      [req.params.id]
+    );
+    if(!r.rows.length) return res.status(404).send('Not found');
+    const data = r.rows[0].data || {};
+    if(!data.proofImageBase64) return res.status(404).send('No proof');
+
+    // الـ base64 يبدأ بـ data:image/... — ابعث HTML بسيط يعرض الصورة
+    res.send(`<!DOCTYPE html><html><head><title>Proof</title><style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style></head><body><img src="${data.proofImageBase64}"></body></html>`);
+  }catch(e){ res.status(500).send(e.message); }
+});
+
+// GET /api/courier-adjustments/pending — تسويات المناديب المعلقة (للمحاسب)
+app.get('/api/courier-adjustments/pending', async (req, res) => {
+  try{
+    const r = await pool.query(
+      `SELECT ca.id, ca.courier_id, ca.amount, ca.reason, ca.status, ca.created_at,
+              CASE WHEN ca.proof_image_base64 IS NOT NULL THEN true ELSE false END as has_proof,
+              c.name as courier_name
+       FROM courier_adjustments ca
+       LEFT JOIN couriers c ON c.id = ca.courier_id
+       WHERE ca.status='pending' AND ca.settlement_id IS NULL
+       ORDER BY ca.created_at ASC`
+    );
+    res.json(r.rows.map(a => ({
+      id: a.id,
+      courierId: a.courier_id,
+      courierName: a.courier_name,
+      amount: parseFloat(a.amount),
+      reason: a.reason,
+      status: a.status,
+      hasProof: a.has_proof,
+      createdAt: a.created_at
+    })));
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier-adjustments/:id/approve
+app.post('/api/courier-adjustments/:id/approve', async (req, res) => {
+  const {reviewedBy} = req.body || {};
+  try{
+    await pool.query(
+      `UPDATE courier_adjustments SET status='approved', reviewed_by=$1, reviewed_at=NOW()
+       WHERE id=$2 AND status='pending'`,
+      [reviewedBy || null, req.params.id]
+    );
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier-adjustments/:id/reject
+app.post('/api/courier-adjustments/:id/reject', async (req, res) => {
+  const {reviewedBy, reason} = req.body || {};
+  try{
+    await pool.query(
+      `UPDATE courier_adjustments SET status='rejected', reviewed_by=$1, reviewed_at=NOW(),
+       rejection_reason=$2 WHERE id=$3 AND status='pending'`,
+      [reviewedBy || null, reason || '', req.params.id]
+    );
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/courier-adjustments/:id/proof
+app.get('/api/courier-adjustments/:id/proof', async (req, res) => {
+  try{
+    const r = await pool.query(
+      'SELECT proof_image_base64 FROM courier_adjustments WHERE id=$1',
+      [req.params.id]
+    );
+    if(!r.rows.length || !r.rows[0].proof_image_base64){
+      return res.status(404).send('Not found');
+    }
+    res.send(`<!DOCTYPE html><html><head><title>Proof</title><style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style></head><body><img src="${r.rows[0].proof_image_base64}"></body></html>`);
+  }catch(e){ res.status(500).send(e.message); }
+});
+
+// ============================================================
+// ===== END: CAFELAX STARS ENDPOINTS =====
+// ============================================================
 
 initDB().then(() => {
     app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT));
