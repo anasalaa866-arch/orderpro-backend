@@ -266,6 +266,50 @@ async function initDB() {
 
       // صلاحية محاسبة المناديب (للمستخدمين)
       "ALTER TABLE users ADD COLUMN IF NOT EXISTS can_settle_couriers BOOLEAN DEFAULT false",
+
+      // ===== SHOP STAFF (موظفي المحل في تطبيق Stars) =====
+      `CREATE TABLE IF NOT EXISTS shop_users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        display_name TEXT,
+        active BOOLEAN DEFAULT true,
+        last_login_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
+
+      // ===== تحويلات Pickup → شحن =====
+      `CREATE TABLE IF NOT EXISTS shipping_transfers (
+        id SERIAL PRIMARY KEY,
+        order_id TEXT NOT NULL,
+        transferred_by_shop_user_id INTEGER,
+        transferred_by_username TEXT,
+        status TEXT DEFAULT 'pending',
+        accepted_by TEXT,
+        accepted_at TIMESTAMPTZ,
+        shipping_cost NUMERIC,
+        assigned_to TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
+      "CREATE INDEX IF NOT EXISTS idx_shipping_transfers_status ON shipping_transfers(status)",
+
+      // علّم الطلب نفسه لما يتحول
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS transfer_requested_at TIMESTAMPTZ",
+
+      // Pickup workflow (موظف المحل)
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS shop_note TEXT DEFAULT ''",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_ready_at TIMESTAMPTZ",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS picked_up_by_customer_at TIMESTAMPTZ",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_not_picked_reason TEXT",
+
+      // ===== إلغاء بواسطة المندوب/المحل (بانتظار استلام الإدارة) =====
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancelled_by_field BOOLEAN DEFAULT false",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancelled_by_username TEXT",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancelled_by_source TEXT", // 'courier' | 'shop'
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_reason TEXT",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_received_at TIMESTAMPTZ",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_received_by TEXT",
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); } catch(e) {}
@@ -2369,6 +2413,7 @@ app.post('/api/login', async (req, res) => {
 
 // Simple courier session tokens (in-memory, 24h TTL)
 const _courierSessions = new Map(); // token -> {courierId, expires}
+const _shopSessions = new Map(); // token -> {shopUserId, username, expires}
 
 function _generateToken(){
   return crypto.randomBytes(32).toString('hex');
@@ -2378,6 +2423,9 @@ function _cleanupExpiredSessions(){
   const now = Date.now();
   for(const [token, session] of _courierSessions.entries()){
     if(session.expires < now) _courierSessions.delete(token);
+  }
+  for(const [token, session] of _shopSessions.entries()){
+    if(session.expires < now) _shopSessions.delete(token);
   }
 }
 setInterval(_cleanupExpiredSessions, 60 * 60 * 1000); // every hour
@@ -2450,18 +2498,17 @@ app.get('/api/courier/me', courierAuth, async (req, res) => {
 // GET /api/courier/my-orders — كل طلبات المندوب مقسمة حسب الحالة
 app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
   try{
+    // الطلبات النشطة (جاري التوصيل، مع/في المحل)
     const r = await pool.query(
       `SELECT * FROM orders
        WHERE courier_id=$1
          AND status IN ('جاري التوصيل', 'جديد')
          AND (merged_into IS NULL OR merged_into = '')
+         AND (cancelled_by_field IS NOT TRUE)
        ORDER BY picked_up_at ASC NULLS LAST, created_at ASC`,
       [req.courierId]
     );
 
-    // تقسيم الطلبات:
-    // - "معاه" (with_me): اللي picked_up_at مش null (المحاسب طبع له ورقة توصيل)
-    // - "جديدة" (new): اللي picked_up_at null (لسه في المحل)
     const withMe = [];
     const newOrders = [];
     const completed = [];
@@ -2475,7 +2522,7 @@ app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
       }
     });
 
-    // كمان الطلبات اللي سلمها النهاردة (للمراجعة)
+    // الطلبات اللي سلمها النهاردة (للمراجعة)
     const todayR = await pool.query(
       `SELECT * FROM orders
        WHERE courier_id=$1
@@ -2486,7 +2533,18 @@ app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
     );
     todayR.rows.forEach(o => completed.push(_mapOrderForCourier(o)));
 
-    res.json({withMe, newOrders, completed});
+    // ✨ الطلبات الملغية بانتظار استلام الإدارة
+    const cancelledR = await pool.query(
+      `SELECT * FROM orders
+       WHERE courier_id=$1
+         AND cancelled_by_field=true
+         AND cancellation_received_at IS NULL
+       ORDER BY cancelled_at DESC`,
+      [req.courierId]
+    );
+    const cancelled = cancelledR.rows.map(o => _mapOrderForCourier(o));
+
+    res.json({withMe, newOrders, completed, cancelled});
   }catch(e){ console.error('my-orders:', e); res.status(500).json({error: e.message}); }
 });
 
@@ -2515,6 +2573,11 @@ function _mapOrderForCourier(r){
     undeliverableReason: r.undeliverable_reason,
     paymentChangeRequested: r.payment_change_requested || false,
     createdAt: r.created_at,
+    // إلغاء (field cancellation)
+    cancelledByField: r.cancelled_by_field || false,
+    cancelledAt: r.cancelled_at,
+    cancellationReason: r.cancellation_reason,
+    cancellationReceivedAt: r.cancellation_received_at,
     // للعرض فقط، مش للـ fulfillment
     shopifyId: r.shopify_id,
     src: r.src,
@@ -2558,7 +2621,105 @@ app.post('/api/courier/orders/:id/deliver', courierAuth, async (req, res) => {
   }catch(e){ res.status(500).json({error: e.message}); }
 });
 
-// POST /api/courier/orders/:id/undeliverable — لم يتم التسليم
+// POST /api/courier/orders/:id/cancel — إلغاء الطلب (العميل رفض نهائياً)
+// body: {reason: string}
+app.post('/api/courier/orders/:id/cancel', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  const {reason} = req.body || {};
+  if(!reason || !reason.trim()) return res.status(400).json({error: 'السبب مطلوب'});
+
+  try{
+    const chk = await pool.query(
+      'SELECT courier_id, status, cancelled_by_field, cancellation_received_at FROM orders WHERE id=$1',
+      [id]
+    );
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(String(o.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+    if(o.status !== 'جاري التوصيل'){
+      return res.status(400).json({error: 'الطلب لا يمكن إلغاؤه في حالته الحالية'});
+    }
+    if(o.cancelled_by_field){
+      return res.status(400).json({error: 'الطلب ملغي بالفعل'});
+    }
+
+    // اسم المندوب للـ log
+    const cR = await pool.query('SELECT name FROM couriers WHERE id=$1', [req.courierId]);
+    const courierName = cR.rows[0]?.name || ('Courier #' + req.courierId);
+
+    await pool.query(
+      `UPDATE orders SET
+        cancelled_by_field=true,
+        cancelled_by_username=$2,
+        cancelled_by_source='courier',
+        cancelled_at=NOW(),
+        cancellation_reason=$3,
+        updated_at=NOW()
+       WHERE id=$1`,
+      [id, courierName, reason.trim()]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'courier_cancelled', $2, $3)`,
+      [id, courierName, reason.trim()]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier/orders/:id/uncancel — إرجاع الطلب الملغي لطلبات المندوب
+// (مسموح فقط لو الإدارة لسه ما أكدتش الاستلام)
+app.post('/api/courier/orders/:id/uncancel', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  try{
+    const chk = await pool.query(
+      `SELECT courier_id, cancelled_by_field, cancellation_received_at, cancelled_by_source
+       FROM orders WHERE id=$1`,
+      [id]
+    );
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(String(o.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+    if(!o.cancelled_by_field){
+      return res.status(400).json({error: 'الطلب ليس ملغي'});
+    }
+    if(o.cancellation_received_at){
+      return res.status(400).json({error: 'الإدارة أكدت الاستلام بالفعل — لا يمكن التراجع'});
+    }
+    if(o.cancelled_by_source !== 'courier'){
+      return res.status(403).json({error: 'الإلغاء تم من المحل — لا يمكن تراجعه من هنا'});
+    }
+
+    await pool.query(
+      `UPDATE orders SET
+        cancelled_by_field=false,
+        cancelled_by_username=NULL,
+        cancelled_by_source=NULL,
+        cancelled_at=NULL,
+        cancellation_reason=NULL,
+        updated_at=NOW()
+       WHERE id=$1`,
+      [id]
+    );
+
+    const cR = await pool.query('SELECT name FROM couriers WHERE id=$1', [req.courierId]);
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'courier_uncancelled', $2, 'reverted')`,
+      [id, cR.rows[0]?.name || ('Courier #' + req.courierId)]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier/orders/:id/undeliverable — لم يتم التسليم (مؤقت، مش إلغاء)
 // body: {reason: string}
 app.post('/api/courier/orders/:id/undeliverable', courierAuth, async (req, res) => {
   const {id} = req.params;
@@ -2609,6 +2770,40 @@ app.post('/api/courier/orders/:id/note', courierAuth, async (req, res) => {
     );
 
     res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier/orders/:id/zone — تعديل المنطقة المصنفة (assigned_zone)
+// body: {zone: string}
+app.post('/api/courier/orders/:id/zone', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  const {zone} = req.body || {};
+  if(!zone || !zone.trim()) return res.status(400).json({error: 'المنطقة مطلوبة'});
+
+  try{
+    const chk = await pool.query('SELECT courier_id, assigned_zone FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(String(o.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+
+    const oldZone = o.assigned_zone || '';
+    const newZone = zone.trim();
+
+    await pool.query(
+      `UPDATE orders SET assigned_zone=$2, zone_manually_set=true, updated_at=NOW() WHERE id=$1`,
+      [id, newZone]
+    );
+
+    // log في order_history (عشان الأدمن يشوف التغيير)
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, field, old_value, new_value, user_name)
+       VALUES ($1, 'zone_changed_by_courier', 'assigned_zone', $2, $3, $4)`,
+      [id, oldZone, newZone, 'Courier #' + req.courierId]
+    ).catch(()=>{});
+
+    res.json({success: true, zone: newZone});
   }catch(e){ res.status(500).json({error: e.message}); }
 });
 
@@ -2980,6 +3175,696 @@ app.get('/api/courier-adjustments/:id/proof', async (req, res) => {
     }
     res.send(`<!DOCTYPE html><html><head><title>Proof</title><style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style></head><body><img src="${r.rows[0].proof_image_base64}"></body></html>`);
   }catch(e){ res.status(500).send(e.message); }
+});
+
+// ============================================================
+// ===== CAFELAX STARS — SHOP MODE (موظف المحل) =====
+// ============================================================
+
+function shopAuth(req, res, next){
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if(!token) return res.status(401).json({error: 'No token'});
+  const session = _shopSessions.get(token);
+  if(!session) return res.status(401).json({error: 'Invalid or expired token'});
+  if(session.expires < Date.now()){
+    _shopSessions.delete(token);
+    return res.status(401).json({error: 'Session expired'});
+  }
+  req.shopUserId = session.shopUserId;
+  req.shopUsername = session.username;
+  next();
+}
+
+// POST /api/shop/login — login لموظفي المحل
+app.post('/api/shop/login', async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error: 'DB unavailable'});
+  const {username, passHash} = req.body || {};
+  if(!username || !passHash) return res.status(400).json({error: 'username و password مطلوبين'});
+  try{
+    const r = await pool.query(
+      `SELECT id, username, display_name FROM shop_users
+       WHERE username=$1 AND password_hash=$2 AND active=true`,
+      [username, passHash]
+    );
+    if(!r.rows.length) return res.json({success: false, error: 'خطأ في اسم المستخدم أو كلمة المرور'});
+    const u = r.rows[0];
+    const token = _generateToken();
+    const expires = Date.now() + 24 * 60 * 60 * 1000;
+    _shopSessions.set(token, {shopUserId: u.id, username: u.username, expires});
+    await pool.query('UPDATE shop_users SET last_login_at=NOW() WHERE id=$1', [u.id]).catch(()=>{});
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: u.id,
+        username: u.username,
+        displayName: u.display_name || u.username,
+        role: 'shop'
+      }
+    });
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/shop/me
+app.get('/api/shop/me', shopAuth, async (req, res) => {
+  try{
+    const r = await pool.query(
+      'SELECT id, username, display_name FROM shop_users WHERE id=$1',
+      [req.shopUserId]
+    );
+    if(!r.rows.length) return res.status(404).json({error: 'User not found'});
+    res.json({
+      id: r.rows[0].id,
+      username: r.rows[0].username,
+      displayName: r.rows[0].display_name || r.rows[0].username,
+      role: 'shop'
+    });
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// Helper: map order for shop view
+function _mapOrderForShop(r){
+  return {
+    id: r.id,
+    name: r.name,
+    phone: r.phone,
+    area: r.area,
+    addr: r.addr,
+    addr2: r.addr2,
+    total: parseFloat(r.total) || 0,
+    ship: parseFloat(r.ship) || 0,
+    paid: r.paid,
+    status: r.status,
+    deliveryType: r.delivery_type,
+    orderNote: r.order_note || '',
+    customerNote: r.customer_note || '',
+    shopNote: r.shop_note || '',
+    items: r.items,
+    pickupReadyAt: r.pickup_ready_at,
+    pickedUpByCustomerAt: r.picked_up_by_customer_at,
+    pickupNotPickedReason: r.pickup_not_picked_reason,
+    paymentChangeRequested: r.payment_change_requested || false,
+    transferRequestedAt: r.transfer_requested_at,
+    createdAt: r.created_at,
+    // إلغاء (field cancellation)
+    cancelledByField: r.cancelled_by_field || false,
+    cancelledAt: r.cancelled_at,
+    cancellationReason: r.cancellation_reason,
+    cancellationReceivedAt: r.cancellation_received_at,
+    src: r.src,
+    shopifyId: r.shopify_id,
+  };
+}
+
+// GET /api/shop/my-orders — طلبات الاستلام من المحل
+app.get('/api/shop/my-orders', shopAuth, async (req, res) => {
+  try{
+    const r = await pool.query(
+      `SELECT * FROM orders
+       WHERE delivery_type='pickup'
+         AND (merged_into IS NULL OR merged_into = '')
+         AND (transfer_requested_at IS NULL)
+         AND (cancelled_by_field IS NOT TRUE)
+         AND status IN ('جديد', 'جاري التوصيل', 'تحت التسوية')
+       ORDER BY created_at ASC`
+    );
+    const todayR = await pool.query(
+      `SELECT * FROM orders
+       WHERE delivery_type='pickup'
+         AND status IN ('مكتمل', 'ملغي')
+         AND updated_at::date = CURRENT_DATE
+       ORDER BY updated_at DESC`
+    );
+
+    const waiting = [];
+    const completed = [];
+
+    r.rows.forEach(o => waiting.push(_mapOrderForShop(o)));
+    todayR.rows.forEach(o => completed.push(_mapOrderForShop(o)));
+
+    // ✨ الإلغاءات بانتظار استلام الإدارة
+    const cancelledR = await pool.query(
+      `SELECT * FROM orders
+       WHERE delivery_type='pickup'
+         AND cancelled_by_field=true
+         AND cancellation_received_at IS NULL
+       ORDER BY cancelled_at DESC`
+    );
+    const cancelled = cancelledR.rows.map(o => _mapOrderForShop(o));
+
+    res.json({waiting, completed, cancelled});
+  }catch(e){ console.error('shop my-orders:', e); res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shop/orders/:id/picked-up — العميل استلم الطلب
+// body: {collectedCash: boolean}
+app.post('/api/shop/orders/:id/picked-up', shopAuth, async (req, res) => {
+  const {id} = req.params;
+  try{
+    const chk = await pool.query('SELECT delivery_type, status, paid FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(o.delivery_type !== 'pickup'){
+      return res.status(400).json({error: 'هذا الطلب ليس pickup'});
+    }
+    if(o.status === 'مكتمل' || o.status === 'ملغي'){
+      return res.status(400).json({error: 'الطلب تم التعامل معه بالفعل'});
+    }
+
+    // status = 'تحت التسوية' (مثل المندوب بالظبط)
+    await pool.query(
+      `UPDATE orders SET
+        status='تحت التسوية',
+        picked_up_by_customer_at=NOW(),
+        updated_at=NOW()
+       WHERE id=$1`,
+      [id]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'shop_picked_up', $2, 'picked_up')`,
+      [id, 'Shop: ' + req.shopUsername]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shop/orders/:id/not-picked — العميل لم يحضر
+app.post('/api/shop/orders/:id/not-picked', shopAuth, async (req, res) => {
+  const {id} = req.params;
+  const {reason} = req.body || {};
+  if(!reason) return res.status(400).json({error: 'السبب مطلوب'});
+  try{
+    const chk = await pool.query('SELECT delivery_type FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    if(chk.rows[0].delivery_type !== 'pickup'){
+      return res.status(400).json({error: 'هذا الطلب ليس pickup'});
+    }
+
+    await pool.query(
+      `UPDATE orders SET
+        pickup_not_picked_reason=$2,
+        updated_at=NOW()
+       WHERE id=$1`,
+      [id, reason]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'shop_not_picked', $2, $3)`,
+      [id, 'Shop: ' + req.shopUsername, reason]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shop/orders/:id/note — ملاحظة الموظف
+app.post('/api/shop/orders/:id/note', shopAuth, async (req, res) => {
+  const {id} = req.params;
+  const {note} = req.body || {};
+  try{
+    await pool.query(
+      `UPDATE orders SET shop_note=$2, updated_at=NOW() WHERE id=$1 AND delivery_type='pickup'`,
+      [id, note || '']
+    );
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shop/orders/:id/request-payment-change — تحويل لمدفوع مع صورة
+app.post('/api/shop/orders/:id/request-payment-change', shopAuth, async (req, res) => {
+  const {id} = req.params;
+  const {proofImageBase64, note} = req.body || {};
+  if(!proofImageBase64) return res.status(400).json({error: 'صورة الدليل مطلوبة'});
+  if(proofImageBase64.length > 5 * 1024 * 1024 * 1.4){
+    return res.status(400).json({error: 'الصورة كبيرة جداً'});
+  }
+  try{
+    const chk = await pool.query('SELECT delivery_type, paid FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    if(chk.rows[0].delivery_type !== 'pickup'){
+      return res.status(400).json({error: 'هذا الطلب ليس pickup'});
+    }
+    if(chk.rows[0].paid) return res.status(400).json({error: 'الطلب مدفوع بالفعل'});
+
+    // نحطها في نفس جدول pending_reviews (نوع: payment_change)
+    // بس مع courier_id = NULL ونحط shop_user_id في الـ data
+    await pool.query(
+      `INSERT INTO pending_reviews (order_id, courier_id, type, data, status)
+       VALUES ($1, NULL, 'payment_change', $2, 'pending')`,
+      [id, JSON.stringify({
+        proofImageBase64,
+        note: note || '',
+        source: 'shop',
+        shopUsername: req.shopUsername
+      })]
+    );
+
+    await pool.query(
+      `UPDATE orders SET payment_change_requested=true, updated_at=NOW() WHERE id=$1`,
+      [id]
+    );
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shop/orders/:id/cancel — إلغاء الطلب (العميل رفض الاستلام)
+// body: {reason: string}
+app.post('/api/shop/orders/:id/cancel', shopAuth, async (req, res) => {
+  const {id} = req.params;
+  const {reason} = req.body || {};
+  if(!reason || !reason.trim()) return res.status(400).json({error: 'السبب مطلوب'});
+
+  try{
+    const chk = await pool.query(
+      `SELECT delivery_type, status, cancelled_by_field FROM orders WHERE id=$1`,
+      [id]
+    );
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(o.delivery_type !== 'pickup'){
+      return res.status(400).json({error: 'هذا الطلب ليس pickup'});
+    }
+    if(o.status === 'مكتمل'){
+      return res.status(400).json({error: 'الطلب مكتمل بالفعل'});
+    }
+    if(o.cancelled_by_field){
+      return res.status(400).json({error: 'الطلب ملغي بالفعل'});
+    }
+
+    await pool.query(
+      `UPDATE orders SET
+        cancelled_by_field=true,
+        cancelled_by_username=$2,
+        cancelled_by_source='shop',
+        cancelled_at=NOW(),
+        cancellation_reason=$3,
+        updated_at=NOW()
+       WHERE id=$1`,
+      [id, req.shopUsername, reason.trim()]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'shop_cancelled', $2, $3)`,
+      [id, 'Shop: ' + req.shopUsername, reason.trim()]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shop/orders/:id/uncancel — إرجاع الطلب الملغي
+app.post('/api/shop/orders/:id/uncancel', shopAuth, async (req, res) => {
+  const {id} = req.params;
+  try{
+    const chk = await pool.query(
+      `SELECT delivery_type, cancelled_by_field, cancellation_received_at, cancelled_by_source
+       FROM orders WHERE id=$1`,
+      [id]
+    );
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(o.delivery_type !== 'pickup'){
+      return res.status(400).json({error: 'هذا الطلب ليس pickup'});
+    }
+    if(!o.cancelled_by_field){
+      return res.status(400).json({error: 'الطلب ليس ملغي'});
+    }
+    if(o.cancellation_received_at){
+      return res.status(400).json({error: 'الإدارة أكدت الاستلام بالفعل'});
+    }
+    if(o.cancelled_by_source !== 'shop'){
+      return res.status(403).json({error: 'الإلغاء تم من المندوب'});
+    }
+
+    await pool.query(
+      `UPDATE orders SET
+        cancelled_by_field=false,
+        cancelled_by_username=NULL,
+        cancelled_by_source=NULL,
+        cancelled_at=NULL,
+        cancellation_reason=NULL,
+        updated_at=NOW()
+       WHERE id=$1`,
+      [id]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'shop_uncancelled', $2, 'reverted')`,
+      [id, 'Shop: ' + req.shopUsername]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shop/orders/:id/transfer-to-shipping — تحويل pickup لشحن
+app.post('/api/shop/orders/:id/transfer-to-shipping', shopAuth, async (req, res) => {
+  const {id} = req.params;
+  try{
+    const chk = await pool.query('SELECT delivery_type, transfer_requested_at, status FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(o.delivery_type !== 'pickup'){
+      return res.status(400).json({error: 'هذا الطلب ليس pickup'});
+    }
+    if(o.transfer_requested_at){
+      return res.status(400).json({error: 'تم إرسال التحويل من قبل'});
+    }
+    if(o.status === 'مكتمل' || o.status === 'ملغي'){
+      return res.status(400).json({error: 'الطلب تم التعامل معه'});
+    }
+
+    // علّم الطلب + أنشئ سجل تحويل
+    await pool.query(
+      `UPDATE orders SET transfer_requested_at=NOW(), updated_at=NOW() WHERE id=$1`,
+      [id]
+    );
+
+    await pool.query(
+      `INSERT INTO shipping_transfers (order_id, transferred_by_shop_user_id, transferred_by_username, status)
+       VALUES ($1, $2, $3, 'pending')`,
+      [id, req.shopUserId, req.shopUsername]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'transfer_to_shipping', $2, 'pending')`,
+      [id, 'Shop: ' + req.shopUsername]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// ===== ADMIN: shipping transfers management =====
+
+// GET /api/shipping-transfers — قائمة التحويلات (filter by status)
+app.get('/api/shipping-transfers', async (req, res) => {
+  const status = req.query.status || 'pending';
+  try{
+    const r = await pool.query(
+      `SELECT st.id, st.order_id, st.transferred_by_username, st.status,
+              st.shipping_cost, st.assigned_to, st.accepted_by, st.accepted_at,
+              st.created_at,
+              o.name, o.phone, o.area, o.addr, o.addr2, o.total, o.paid,
+              o.customer_note, o.order_note, o.shop_note, o.delivery_type
+       FROM shipping_transfers st
+       LEFT JOIN orders o ON o.id = st.order_id
+       WHERE st.status = $1
+       ORDER BY st.created_at ASC`,
+      [status]
+    );
+    res.json(r.rows.map(row => ({
+      id: row.id,
+      orderId: row.order_id,
+      transferredByUsername: row.transferred_by_username,
+      status: row.status,
+      shippingCost: row.shipping_cost != null ? parseFloat(row.shipping_cost) : null,
+      assignedTo: row.assigned_to,
+      acceptedBy: row.accepted_by,
+      acceptedAt: row.accepted_at,
+      createdAt: row.created_at,
+      order: {
+        id: row.order_id,
+        name: row.name,
+        phone: row.phone,
+        area: row.area,
+        addr: row.addr,
+        addr2: row.addr2,
+        total: parseFloat(row.total) || 0,
+        paid: row.paid,
+        customerNote: row.customer_note,
+        orderNote: row.order_note,
+        shopNote: row.shop_note,
+        deliveryType: row.delivery_type
+      }
+    })));
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shipping-transfers/:id/accept-and-assign
+// body: {shippingCost, target: 'bosta' | 'courier:<id>', acceptedBy}
+app.post('/api/shipping-transfers/:id/accept-and-assign', async (req, res) => {
+  const {shippingCost, target, acceptedBy} = req.body || {};
+  if(shippingCost == null || isNaN(parseFloat(shippingCost))){
+    return res.status(400).json({error: 'سعر الشحن مطلوب'});
+  }
+  if(!target) return res.status(400).json({error: 'الوجهة مطلوبة (bosta أو courier)'});
+
+  try{
+    const trR = await pool.query(
+      `SELECT * FROM shipping_transfers WHERE id=$1 AND status='pending'`,
+      [req.params.id]
+    );
+    if(!trR.rows.length) return res.status(404).json({error: 'التحويل غير موجود أو تم معالجته'});
+    const tr = trR.rows[0];
+
+    // حدد الوجهة
+    let isBosta = false;
+    let courierId = null;
+    let assignedLabel = '';
+
+    if(target === 'bosta'){
+      isBosta = true;
+      assignedLabel = 'Bosta';
+    } else if(target.startsWith('courier:')){
+      courierId = parseInt(target.split(':')[1]);
+      if(isNaN(courierId)) return res.status(400).json({error: 'courier id غير صحيح'});
+      const cR = await pool.query('SELECT name FROM couriers WHERE id=$1', [courierId]);
+      if(!cR.rows.length) return res.status(404).json({error: 'المندوب غير موجود'});
+      assignedLabel = cR.rows[0].name;
+    } else {
+      return res.status(400).json({error: 'الوجهة غير صحيحة'});
+    }
+
+    const cost = parseFloat(shippingCost);
+
+    // حدّث الطلب: غيّر delivery_type لـ 'normal' + عيّن الشحن + عيّن المندوب/Bosta
+    const updates = [
+      `delivery_type='normal'`,
+      `ship=$2`,
+      `status='جاري التوصيل'`,
+      `updated_at=NOW()`,
+    ];
+    const params = [tr.order_id, cost];
+    if(isBosta){
+      updates.push(`is_bosta=true`, `courier_id=NULL`);
+    } else {
+      updates.push(`is_bosta=false`, `courier_id=$3`);
+      params.push(courierId);
+    }
+    await pool.query(
+      `UPDATE orders SET ${updates.join(', ')} WHERE id=$1`,
+      params
+    );
+
+    // حدّث سجل التحويل
+    await pool.query(
+      `UPDATE shipping_transfers SET
+        status='accepted',
+        shipping_cost=$2,
+        assigned_to=$3,
+        accepted_by=$4,
+        accepted_at=NOW()
+       WHERE id=$1`,
+      [req.params.id, cost, assignedLabel, acceptedBy || null]
+    );
+
+    // log في history
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'transfer_accepted_and_assigned', $2, $3)`,
+      [tr.order_id, acceptedBy || 'admin', `${assignedLabel} — shipping: ${cost}`]
+    ).catch(()=>{});
+
+    res.json({
+      success: true,
+      orderId: tr.order_id,
+      assignedTo: assignedLabel,
+      shippingCost: cost,
+      isBosta
+    });
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shipping-transfers/:id/reject — رفض التحويل (الطلب يرجع pickup عادي)
+app.post('/api/shipping-transfers/:id/reject', async (req, res) => {
+  const {reason, rejectedBy} = req.body || {};
+  try{
+    const trR = await pool.query(
+      `SELECT order_id FROM shipping_transfers WHERE id=$1 AND status='pending'`,
+      [req.params.id]
+    );
+    if(!trR.rows.length) return res.status(404).json({error: 'التحويل غير موجود'});
+
+    // ارجع الطلب لحالته كـ pickup
+    await pool.query(
+      `UPDATE orders SET transfer_requested_at=NULL, updated_at=NOW() WHERE id=$1`,
+      [trR.rows[0].order_id]
+    );
+
+    await pool.query(
+      `UPDATE shipping_transfers SET status='rejected', accepted_by=$2, accepted_at=NOW() WHERE id=$1`,
+      [req.params.id, rejectedBy || null]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'transfer_rejected', $2, $3)`,
+      [trR.rows[0].order_id, rejectedBy || 'admin', reason || 'rejected']
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/shop-users — admin creates shop user
+app.post('/api/shop-users', async (req, res) => {
+  const {username, passHash, displayName} = req.body || {};
+  if(!username || !passHash) return res.status(400).json({error: 'username و password مطلوبين'});
+  try{
+    const r = await pool.query(
+      `INSERT INTO shop_users (username, password_hash, display_name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (username) DO UPDATE SET password_hash=$2, display_name=$3
+       RETURNING id, username, display_name`,
+      [username, passHash, displayName || username]
+    );
+    res.json({success: true, user: r.rows[0]});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/shop-users — list
+app.get('/api/shop-users', async (req, res) => {
+  try{
+    const r = await pool.query(
+      'SELECT id, username, display_name, active, last_login_at, created_at FROM shop_users ORDER BY created_at DESC'
+    );
+    res.json(r.rows);
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// ===== Field Cancellations (إلغاءات بانتظار استلام الإدارة) =====
+
+// GET /api/field-cancellations — list all pending cancellations
+app.get('/api/field-cancellations', async (req, res) => {
+  try{
+    const r = await pool.query(
+      `SELECT o.id, o.name, o.phone, o.area, o.addr, o.addr2, o.total, o.paid,
+              o.delivery_type, o.cancelled_by_username, o.cancelled_by_source,
+              o.cancelled_at, o.cancellation_reason, o.courier_id,
+              c.name as courier_name
+       FROM orders o
+       LEFT JOIN couriers c ON c.id = o.courier_id
+       WHERE o.cancelled_by_field=true
+         AND o.cancellation_received_at IS NULL
+       ORDER BY o.cancelled_at ASC`
+    );
+    res.json(r.rows.map(row => ({
+      id: row.id,
+      name: row.name,
+      phone: row.phone,
+      area: row.area,
+      addr: row.addr,
+      addr2: row.addr2,
+      total: parseFloat(row.total) || 0,
+      paid: row.paid,
+      deliveryType: row.delivery_type,
+      cancelledByUsername: row.cancelled_by_username,
+      cancelledBySource: row.cancelled_by_source,
+      cancelledAt: row.cancelled_at,
+      cancellationReason: row.cancellation_reason,
+      courierId: row.courier_id,
+      courierName: row.courier_name,
+    })));
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/field-cancellations/:orderId/confirm-receive
+// الإدارة أكدت إنها استلمت الطلب من المندوب/المحل
+// body: {receivedBy: string}
+app.post('/api/field-cancellations/:orderId/confirm-receive', async (req, res) => {
+  const {orderId} = req.params;
+  const {receivedBy} = req.body || {};
+  try{
+    const chk = await pool.query(
+      `SELECT cancelled_by_field, cancellation_received_at FROM orders WHERE id=$1`,
+      [orderId]
+    );
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(!o.cancelled_by_field){
+      return res.status(400).json({error: 'الطلب ليس ملغي'});
+    }
+    if(o.cancellation_received_at){
+      return res.status(400).json({error: 'تم تأكيد الاستلام من قبل'});
+    }
+
+    await pool.query(
+      `UPDATE orders SET
+        cancellation_received_at=NOW(),
+        cancellation_received_by=$2,
+        status='ملغي',
+        updated_at=NOW()
+       WHERE id=$1`,
+      [orderId, receivedBy || null]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'cancellation_received', $2, 'admin confirmed')`,
+      [orderId, receivedBy || 'admin']
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/field-cancellations/:orderId/revert
+// الإدارة قررت ترجع الطلب (الإلغاء كان بالغلط)
+app.post('/api/field-cancellations/:orderId/revert', async (req, res) => {
+  const {orderId} = req.params;
+  const {revertedBy} = req.body || {};
+  try{
+    const chk = await pool.query(
+      `SELECT cancelled_by_field, cancellation_received_at FROM orders WHERE id=$1`,
+      [orderId]
+    );
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    if(!chk.rows[0].cancelled_by_field){
+      return res.status(400).json({error: 'الطلب ليس ملغي'});
+    }
+    if(chk.rows[0].cancellation_received_at){
+      return res.status(400).json({error: 'تم تأكيد الاستلام بالفعل'});
+    }
+
+    await pool.query(
+      `UPDATE orders SET
+        cancelled_by_field=false,
+        cancelled_by_username=NULL,
+        cancelled_by_source=NULL,
+        cancelled_at=NULL,
+        cancellation_reason=NULL,
+        updated_at=NOW()
+       WHERE id=$1`,
+      [orderId]
+    );
+
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'cancellation_reverted_by_admin', $2, 'reverted')`,
+      [orderId, revertedBy || 'admin']
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
 });
 
 // ============================================================
