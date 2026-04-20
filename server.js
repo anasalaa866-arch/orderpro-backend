@@ -1963,6 +1963,66 @@ app.post('/api/invoices/batch-generate', async (req, res) => {
   res.json({ total: orderIds.length, generated, cached, failed, tookSec: parseFloat(took) });
 });
 
+// POST /api/invoices/batch-html → يرجع كل الـ HTML للفواتير في response واحد (أسرع بكتير من 30 fetch)
+app.post('/api/invoices/batch-html', async (req, res) => {
+  const { orderIds } = req.body;
+  if (!Array.isArray(orderIds) || !orderIds.length) return res.status(400).json({ error: 'orderIds مطلوبة' });
+  if (orderIds.length > 200) return res.status(400).json({ error: 'max 200 orders per request' });
+
+  const startTs = Date.now();
+  try {
+    // جيب كل الفواتير المحفوظة في الكاش في query واحد
+    const { rows } = await pool.query(
+      `SELECT order_id, html FROM invoice_cache
+       WHERE order_id = ANY($1) AND expires_at > NOW()`,
+      [orderIds]
+    );
+
+    const cacheMap = {};
+    rows.forEach(r => { cacheMap[r.order_id] = r.html; });
+
+    // حدد الـ orders اللي ناقصين في الكاش
+    const missing = orderIds.filter(id => !cacheMap[id]);
+
+    // ولّد المفقودة في parallel (5 بنفس الوقت)
+    if (missing.length) {
+      console.log(`batch-html: ${missing.length} orders need generation`);
+      const CONCURRENCY = 5;
+      for (let i = 0; i < missing.length; i += CONCURRENCY) {
+        const chunk = missing.slice(i, i + CONCURRENCY);
+        await Promise.all(chunk.map(async (id) => {
+          try {
+            await cacheInvoiceForOrder(id);
+            const r = await pool.query('SELECT html FROM invoice_cache WHERE order_id=$1', [id]);
+            if (r.rows.length) cacheMap[id] = r.rows[0].html;
+          } catch(e) {
+            console.warn('batch-html gen failed for', id, ':', e.message);
+          }
+        }));
+      }
+    }
+
+    const took = ((Date.now() - startTs) / 1000).toFixed(1);
+    console.log(`batch-html: ${orderIds.length} orders returned in ${took}s`);
+
+    // ارجع array مرتب حسب ترتيب المدخلات
+    const result = orderIds.map(id => ({
+      orderId: id,
+      html: cacheMap[id] || null,
+    }));
+
+    res.json({
+      invoices: result,
+      tookSec: parseFloat(took),
+      totalOrders: orderIds.length,
+      missing: orderIds.length - Object.keys(cacheMap).length
+    });
+  } catch(e) {
+    console.error('batch-html error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 async function enrichLineItemsWithImages(lineItems, host, accessToken) {
   if (!lineItems || !lineItems.length || !host || !accessToken) return lineItems;
 
