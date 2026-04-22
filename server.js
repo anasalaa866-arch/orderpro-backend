@@ -310,6 +310,7 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_reason TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_received_at TIMESTAMPTZ",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_received_by TEXT",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_sequence INTEGER", // ترتيب التوصيل للمندوب
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); } catch(e) {}
@@ -2565,7 +2566,10 @@ app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
          AND status IN ('جاري التوصيل', 'جديد')
          AND (merged_into IS NULL OR merged_into = '')
          AND (cancelled_by_field IS NOT TRUE)
-       ORDER BY picked_up_at ASC NULLS LAST, created_at ASC`,
+       ORDER BY 
+         CASE WHEN picked_up_at IS NOT NULL THEN delivery_sequence END ASC NULLS LAST,
+         picked_up_at ASC NULLS LAST, 
+         created_at ASC`,
       [req.courierId]
     );
 
@@ -2617,6 +2621,8 @@ function _mapOrderForCourier(r){
     area: r.area,
     addr: r.addr,
     addr2: r.addr2,
+    governorate: r.governorate,
+    city: r.city,
     total: parseFloat(r.total) || 0,
     ship: parseFloat(r.ship) || 0,
     paid: r.paid,
@@ -2630,6 +2636,7 @@ function _mapOrderForCourier(r){
     items: r.items,
     pickedUpAt: r.picked_up_at,
     deliveredAt: r.courier_delivered_at,
+    deliverySequence: r.delivery_sequence,
     undeliverableReason: r.undeliverable_reason,
     paymentChangeRequested: r.payment_change_requested || false,
     createdAt: r.created_at,
@@ -2845,6 +2852,59 @@ app.post('/api/courier/orders/:id/pickup', courierAuth, async (req, res) => {
     ).catch(()=>{});
 
     res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier/orders/:id/sequence — تحديد ترتيب التوصيل
+// body: {sequence: number}
+app.post('/api/courier/orders/:id/sequence', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  const {sequence} = req.body || {};
+  
+  if(typeof sequence !== 'number' || sequence < 0){
+    return res.status(400).json({error: 'sequence لازم يكون رقم موجب'});
+  }
+  
+  try{
+    const chk = await pool.query('SELECT courier_id FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    if(String(chk.rows[0].courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+    
+    await pool.query(
+      'UPDATE orders SET delivery_sequence=$1, updated_at=NOW() WHERE id=$2',
+      [sequence || null, id]
+    );
+    
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/courier/orders/auto-sequence — ترتيب تلقائي حسب المنطقة
+app.post('/api/courier/orders/auto-sequence', courierAuth, async (req, res) => {
+  try{
+    // جيب كل طلبات المندوب اللي معاه
+    const {rows} = await pool.query(
+      `SELECT id, governorate, area, city 
+       FROM orders 
+       WHERE courier_id=$1 AND status='جاري التوصيل' AND picked_up_at IS NOT NULL
+       ORDER BY governorate, area, city, id`,
+      [req.courierId]
+    );
+    
+    if(!rows.length) return res.json({success: true, count: 0});
+    
+    // رقّم الطلبات بالترتيب
+    let seq = 1;
+    for(const order of rows){
+      await pool.query(
+        'UPDATE orders SET delivery_sequence=$1 WHERE id=$2',
+        [seq++, order.id]
+      );
+    }
+    
+    res.json({success: true, count: rows.length});
   }catch(e){ res.status(500).json({error: e.message}); }
 });
 
