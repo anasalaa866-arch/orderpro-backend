@@ -119,6 +119,8 @@ async function initDB() {
         account TEXT,
         pages INTEGER DEFAULT 48,
         note TEXT,
+        first_num INTEGER,
+        last_num INTEGER,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
@@ -2100,15 +2102,25 @@ app.get('/api/check-books', async (req, res) => {
 });
 
 app.post('/api/check-books', async (req, res) => {
-  const { id, name, bank, account, pages, note, firstNum } = req.body;
-  if (!DB_ENABLED) return res.json({ book: req.body });
-  // إضافة first_num column لو مش موجودة
-  try{ await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1"); }catch(e){}
-  await pool.query(
-    'INSERT INTO check_books (id,name,bank,account,pages,note,first_num) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6,first_num=$7',
-    [id, name, bank||'', account||'', pages||48, note||'', firstNum||1]
-  );
-  res.json({ book: req.body });
+  try {
+    const { id, name, bank, account, pages, note, firstNum, lastNum } = req.body;
+    if (!DB_ENABLED) return res.json({ book: req.body });
+    
+    // إضافة first_num و last_num columns لو مش موجودة
+    try{ 
+      await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1"); 
+      await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER");
+    }catch(e){ console.warn('alter check_books:', e.message); }
+    
+    await pool.query(
+      'INSERT INTO check_books (id,name,bank,account,pages,note,first_num,last_num) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6,first_num=$7,last_num=$8',
+      [id, name, bank||'', account||'', pages||48, note||'', firstNum||1, lastNum||null]
+    );
+    res.json({ book: req.body });
+  } catch(e) {
+    console.error('check-books POST error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.delete('/api/check-books/:id', async (req, res) => {
@@ -2154,27 +2166,50 @@ app.post('/api/sync-checks', async (req, res) => {
   const { books, checks, suppliers } = req.body;
   if (!DB_ENABLED) return res.json({ ok: true });
   try {
-    // sync books
+    let booksCount = 0, checksCount = 0;
+    
+    // sync books first
     for (const b of (books||[])) {
-      await pool.query(
-        `INSERT INTO check_books (id,name,bank,account,pages,note,first_num,last_num)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-         ON CONFLICT (id) DO UPDATE SET
-         name=$2,bank=$3,account=$4,pages=$5,note=$6,first_num=$7,last_num=$8`,
-        [b.id, b.name||'', b.bank||'', b.account||'', b.pages||48, b.note||'', b.firstNum||1, b.lastNum||null]
-      );
+      try{
+        await pool.query(
+          `INSERT INTO check_books (id,name,bank,account,pages,note,first_num,last_num)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+           ON CONFLICT (id) DO UPDATE SET
+           name=$2,bank=$3,account=$4,pages=$5,note=$6,first_num=$7,last_num=$8`,
+          [b.id, b.name||'', b.bank||'', b.account||'', b.pages||48, b.note||'', b.firstNum||1, b.lastNum||null]
+        );
+        booksCount++;
+      }catch(e){
+        console.error('sync book error:', b.id, e.message);
+      }
     }
-    // sync checks
+    
+    // sync checks (skip if book_id doesn't exist)
     for (const c of (checks||[])) {
-      await pool.query(
-        `INSERT INTO checks (id,num,payee,amount,date,book_id,invoice,note,img,status,done_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         ON CONFLICT (id) DO UPDATE SET
-         num=$2,payee=$3,amount=$4,date=$5,book_id=$6,invoice=$7,note=$8,img=$9,status=$10,done_at=$11`,
-        [c.id, c.num, c.payee||'', c.amount||0, c.date||null, c.bookId||null,
-         c.invoice||'', c.note||'', c.img||'', c.status||'pending', c.doneAt||null]
-      );
+      try{
+        // تحقق من وجود الدفتر أول
+        if(c.bookId){
+          const bookCheck = await pool.query('SELECT id FROM check_books WHERE id=$1', [c.bookId]);
+          if(!bookCheck.rows.length){
+            console.warn('Check skipped - book not found:', c.id, 'book:', c.bookId);
+            continue;
+          }
+        }
+        
+        await pool.query(
+          `INSERT INTO checks (id,num,payee,amount,date,book_id,invoice,note,img,status,done_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           ON CONFLICT (id) DO UPDATE SET
+           num=$2,payee=$3,amount=$4,date=$5,book_id=$6,invoice=$7,note=$8,img=$9,status=$10,done_at=$11`,
+          [c.id, c.num, c.payee||'', c.amount||0, c.date||null, c.bookId||null,
+           c.invoice||'', c.note||'', c.img||'', c.status||'pending', c.doneAt||null]
+        );
+        checksCount++;
+      }catch(e){
+        console.error('sync check error:', c.id, e.message);
+      }
     }
+    
     // sync suppliers
     if (suppliers && suppliers.length) {
       try {
@@ -2189,7 +2224,8 @@ app.post('/api/sync-checks', async (req, res) => {
         }
       } catch(e) { console.warn('sync suppliers:', e.message); }
     }
-    res.json({ ok: true, books: (books||[]).length, checks: (checks||[]).length });
+    
+    res.json({ ok: true, books: booksCount, checks: checksCount });
   } catch(e) {
     console.error('sync-checks error:', e.message);
     res.status(500).json({ error: e.message });
