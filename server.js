@@ -2812,6 +2812,42 @@ app.post('/api/courier/orders/:id/undeliverable', courierAuth, async (req, res) 
   }catch(e){ res.status(500).json({error: e.message}); }
 });
 
+// POST /api/courier/orders/:id/pickup — المندوب يعلّم إنه استلم الطلب من المحل
+app.post('/api/courier/orders/:id/pickup', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  try{
+    const chk = await pool.query(
+      'SELECT courier_id, status, picked_up_at FROM orders WHERE id=$1',
+      [id]
+    );
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(String(o.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+    if(o.status !== 'جاري التوصيل'){
+      return res.status(400).json({error: 'الطلب لا يمكن استلامه في حالته الحالية'});
+    }
+    if(o.picked_up_at){
+      return res.status(400).json({error: 'الطلب مستلم بالفعل'});
+    }
+
+    await pool.query(
+      `UPDATE orders SET picked_up_at=NOW(), updated_at=NOW() WHERE id=$1`,
+      [id]
+    );
+
+    const cR = await pool.query('SELECT name FROM couriers WHERE id=$1', [req.courierId]);
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'courier_picked_up_self', $2, 'picked up from shop')`,
+      [id, cR.rows[0]?.name || ('Courier #' + req.courierId)]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
 // POST /api/courier/orders/:id/note — إضافة/تعديل ملاحظة المندوب
 // body: {note: string}
 app.post('/api/courier/orders/:id/note', courierAuth, async (req, res) => {
