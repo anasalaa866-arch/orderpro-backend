@@ -2104,7 +2104,12 @@ app.get('/api/check-books', async (req, res) => {
 app.post('/api/check-books', async (req, res) => {
   try {
     const { id, name, bank, account, pages, note, firstNum, lastNum } = req.body;
-    if (!DB_ENABLED) return res.json({ book: req.body });
+    console.log('📘 POST /api/check-books:', { id, name, bank, pages, firstNum, lastNum });
+    
+    if (!DB_ENABLED){
+      console.log('⚠️ DB not enabled, returning mock response');
+      return res.json({ book: req.body });
+    }
     
     // إضافة first_num و last_num columns لو مش موجودة
     try{ 
@@ -2112,13 +2117,16 @@ app.post('/api/check-books', async (req, res) => {
       await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER");
     }catch(e){ console.warn('alter check_books:', e.message); }
     
-    await pool.query(
-      'INSERT INTO check_books (id,name,bank,account,pages,note,first_num,last_num) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6,first_num=$7,last_num=$8',
+    console.log('💾 Inserting book into DB...');
+    const result = await pool.query(
+      'INSERT INTO check_books (id,name,bank,account,pages,note,first_num,last_num) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6,first_num=$7,last_num=$8 RETURNING *',
       [id, name, bank||'', account||'', pages||48, note||'', firstNum||1, lastNum||null]
     );
-    res.json({ book: req.body });
+    
+    console.log('✅ Book saved successfully:', result.rows[0]);
+    res.json({ book: result.rows[0] });
   } catch(e) {
-    console.error('check-books POST error:', e.message);
+    console.error('❌ check-books POST error:', e.message, e.stack);
     res.status(500).json({ error: e.message });
   }
 });
