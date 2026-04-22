@@ -3065,6 +3065,40 @@ app.get('/api/courier/my-statement', courierAuth, async (req, res) => {
 
 // ====== ADMIN/ACCOUNTANT ENDPOINTS ======
 
+// POST /api/orders/bulk-pickup — تسجيل استلام عدة طلبات من المحل دفعة واحدة
+app.post('/api/orders/bulk-pickup', async (req, res) => {
+  const { orderIds } = req.body;
+  if (!Array.isArray(orderIds) || !orderIds.length) {
+    return res.status(400).json({ error: 'orderIds مطلوبة' });
+  }
+  if (!DB_ENABLED) return res.json({ ok: true });
+  
+  try {
+    await pool.query(
+      `UPDATE orders 
+       SET status = 'مكتمل', 
+           picked_up_at = NOW(),
+           updated_at = NOW()
+       WHERE id = ANY($1::text[])`,
+      [orderIds]
+    );
+    
+    // سجّل في الـ history
+    for (const id of orderIds) {
+      await pool.query(
+        `INSERT INTO order_history (order_id, action, user_name, new_value)
+         VALUES ($1, 'bulk_pickup', 'shop_staff', 'picked up from shop')`,
+        [id]
+      ).catch(() => {});
+    }
+    
+    res.json({ success: true, count: orderIds.length });
+  } catch(e) {
+    console.error('bulk-pickup error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/couriers/:id/mark-picked-up
 // لما المحاسب يطبع ورقة توصيل، بنعلم الطلبات إنها اتسلمت للمندوب
 // body: {orderIds: string[]}
