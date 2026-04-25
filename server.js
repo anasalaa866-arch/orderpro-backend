@@ -333,18 +333,21 @@ async function initDB() {
 
     // ===== v177: Auto-seed shop courier + setting =====
     try {
-      // 1) دور على المحل لو موجود (role='shop' أو phone='shop')
+      // 1) دور على المحل لو موجود (role='shop' أو phone='shop' أو username='shop')
       let shopId = null;
       const existing = await pool.query(
-        `SELECT id FROM couriers WHERE role = 'shop' OR phone = 'shop' LIMIT 1`
+        `SELECT id FROM couriers WHERE role = 'shop' OR phone = 'shop' OR username = 'shop' LIMIT 1`
       );
       if (existing.rows.length) {
         shopId = existing.rows[0].id;
+        // تأكد إن دوره shop
+        await pool.query(`UPDATE couriers SET role='shop' WHERE id=$1 AND (role IS NULL OR role != 'shop')`, [shopId]).catch(()=>{});
+        console.log('✅ Shop courier already exists, ID:', shopId);
       } else {
-        // 2) لو مش موجود، اعمله
+        // 2) لو مش موجود، اعمله — استخدم بس الأعمدة المضمونة الوجود
         const ins = await pool.query(
-          `INSERT INTO couriers (name, phone, email, role, active)
-           VALUES ('المحل - Trivium Square', 'shop', 'shop@cafelax.com', 'shop', true)
+          `INSERT INTO couriers (name, phone, zone, vehicle, ship, role, status)
+           VALUES ('المحل - Trivium Square', 'shop', 'المحل', 'استلام', 0, 'shop', 'متاح')
            RETURNING id`
         );
         shopId = ins.rows[0]?.id;
@@ -358,10 +361,12 @@ async function initDB() {
            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
           [String(shopId)]
         );
-        console.log('✅ shop_courier_id setting:', shopId);
+        console.log('✅ shop_courier_id setting saved:', shopId);
+      } else {
+        console.log('⚠️ Could not determine shop_courier_id');
       }
     } catch (e) {
-      console.log('⚠️ Shop courier auto-seed skipped:', e.message);
+      console.error('❌ Shop courier auto-seed FAILED:', e.message, e.stack);
     }
 
   } catch (err) {
@@ -2289,7 +2294,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v55-2026-04-25';
+const SERVER_VERSION = 'v56-2026-04-25-shopfix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -4444,7 +4449,10 @@ app.post('/api/preparation/complete', async (req, res) => {
 
 app.get('/api/preparation/orders', async (req, res) => {
   if (!DB_ENABLED) return res.json({ orders: [] });
-  const { preparerId } = req.query;
+  const preparerId = parseInt(req.query.preparerId, 10);
+  if (!preparerId || isNaN(preparerId)) {
+    return res.status(400).json({ error: 'preparerId مطلوب ويجب أن يكون رقماً صحيحاً', received: req.query.preparerId });
+  }
   try {
     // SELECT أعمدة معينة بس (ليس *) عشان نتجنب bosta_awb_base64 الضخم
     // وفلترة أدق: الطلبات اللي محتاجة تحضير فقط (مش completed)، ومش ملغية
@@ -4478,8 +4486,8 @@ app.get('/api/preparation/orders', async (req, res) => {
     }));
     res.json({ orders });
   } catch (e) {
-    console.error('Get preparation orders error:', e);
-    res.status(500).json({ error: e.message });
+    console.error('Get preparation orders error:', e.message, e.stack);
+    res.status(500).json({ error: 'فشل تحميل الطلبات: ' + e.message });
   }
 });
 
