@@ -325,6 +325,12 @@ async function initDB() {
       "CREATE INDEX IF NOT EXISTS idx_orders_preparation_started_by ON orders(preparation_started_by)",
       "ALTER TABLE couriers ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'courier'",
       "UPDATE couriers SET role = 'courier' WHERE role IS NULL",
+      // v66: indexes حرجة لتحسين سرعة الـ /api/orders والـ /api/courier/my-orders
+      "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_orders_courier_id ON orders(courier_id)",
+      "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
+      "CREATE INDEX IF NOT EXISTS idx_orders_delivery_type ON orders(delivery_type)",
+      "CREATE INDEX IF NOT EXISTS idx_orders_courier_status ON orders(courier_id, status)",
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); } catch(e) {}
@@ -537,7 +543,7 @@ function mapShopifyOrder(sh) {
 
 // helper: row to frontend format
 function rowToOrder(r) {
-  return {
+  const out = {
     id: r.id, shopifyId: r.shopify_id, src: r.src, name: r.name,
     phone: r.phone, area: r.area, addr: r.addr,
     total: parseFloat(r.total) || 0, ship: parseFloat(r.ship) || 50,
@@ -548,7 +554,7 @@ function rowToOrder(r) {
     shippingMethod: r.shipping_method, deliveryType: r.delivery_type,
     note: r.note, items: r.items, time: r.time,
     bostaId: r.bosta_id, bostaTrackingNo: r.bosta_tracking,
-    bostaAwbUrl: r.bosta_awb_url, bostaAwbBase64: r.bosta_awb_base64,
+    bostaAwbUrl: r.bosta_awb_url,
     bostaStatus: r.bosta_status, hasProblem: r.has_problem || false,
     assignedZone: r.assigned_zone || null,
     zoneManuallySet: r.zone_manually_set || false,
@@ -565,6 +571,9 @@ function rowToOrder(r) {
     mergedIds: r.merged_ids ? JSON.parse(r.merged_ids) : null,
     createdAt: r.created_at, updatedAt: r.updated_at,
   };
+  // لو الـ awb base64 موجود في الـ row (عند الـ fetch المخصوص)، رجّعه
+  if (r.bosta_awb_base64) out.bostaAwbBase64 = r.bosta_awb_base64;
+  return out;
 }
 
 // ===== SHOPIFY WEBHOOK =====
@@ -657,8 +666,35 @@ app.post('/webhook/shopify', async (req, res) => {
 // ===== ORDERS API =====
 app.get('/api/orders', async (req, res) => {
   if (!DB_ENABLED) return res.json({ orders: memOrders, total: memOrders.length });
-  const { rows } = await pool.query('SELECT * FROM orders ORDER BY created_at DESC');
+  // ⚠️ مهم: نختار الأعمدة بالاسم بدل * عشان نتجنب bosta_awb_base64 الضخم (ممكن يكون 100KB+ لكل طلب)
+  // الـ AWB base64 بيتجاب عند الحاجة فقط من /api/orders/:id/awb
+  const { rows } = await pool.query(`
+    SELECT id, shopify_id, src, name, phone, area, addr, addr2, province, total, ship,
+           courier_id, is_bosta, status, paid, shipping_method, delivery_type, note, items,
+           time, bosta_id, bosta_tracking, bosta_awb_url, bosta_status,
+           has_problem, assigned_zone, zone_manually_set, order_note, customer_note,
+           bosta_exported, bosta_exported_at, line_items_json, subtotal_price, shipping_price,
+           source_name, batch_code, merged_into, merged_ids, created_at, updated_at
+    FROM orders
+    ORDER BY created_at DESC
+    LIMIT 2000
+  `);
   res.json({ orders: rows.map(rowToOrder), total: rows.length });
+});
+
+// /api/orders/:id/awb — يرجع الـ AWB base64 لطلب واحد عند الحاجة
+app.get('/api/orders/:id/awb', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  try {
+    const r = await pool.query('SELECT bosta_awb_base64, bosta_awb_url FROM orders WHERE id=$1', [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Order not found' });
+    res.json({
+      bostaAwbBase64: r.rows[0].bosta_awb_base64 || null,
+      bostaAwbUrl: r.rows[0].bosta_awb_url || null
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/orders', async (req, res) => {
@@ -2338,7 +2374,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v65-2026-04-25-qr-img';
+const SERVER_VERSION = 'v66-2026-04-25-perf';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -2738,9 +2774,17 @@ app.get('/api/courier/me', courierAuth, async (req, res) => {
 // GET /api/courier/my-orders — كل طلبات المندوب مقسمة حسب الحالة
 app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
   try{
+    // الأعمدة المطلوبة بس (مش *) عشان نتجنب الـ awb base64 الضخم
+    const COLS = `id, shopify_id, src, name, phone, area, addr, addr2, governorate, city,
+                  total, ship, paid, status, delivery_type, assigned_zone, batch_code,
+                  order_note, customer_note, courier_note, items, picked_up_at,
+                  courier_delivered_at, delivery_sequence, undeliverable_reason,
+                  payment_change_requested, created_at, cancelled_by_field, cancelled_at,
+                  cancellation_reason, cancellation_received_at, courier_id, merged_into`;
+
     // الطلبات النشطة (جاري التوصيل، مع/في المحل)
     const r = await pool.query(
-      `SELECT * FROM orders
+      `SELECT ${COLS} FROM orders
        WHERE courier_id=$1
          AND status IN ('جاري التوصيل', 'جديد')
          AND (merged_into IS NULL OR merged_into = '')
@@ -2767,7 +2811,7 @@ app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
 
     // الطلبات اللي سلمها النهاردة (للمراجعة)
     const todayR = await pool.query(
-      `SELECT * FROM orders
+      `SELECT ${COLS} FROM orders
        WHERE courier_id=$1
          AND courier_delivered_at IS NOT NULL
          AND courier_delivered_at::date = CURRENT_DATE
@@ -2778,7 +2822,7 @@ app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
 
     // ✨ الطلبات الملغية بانتظار استلام الإدارة
     const cancelledR = await pool.query(
-      `SELECT * FROM orders
+      `SELECT ${COLS} FROM orders
        WHERE courier_id=$1
          AND cancelled_by_field=true
          AND cancellation_received_at IS NULL
@@ -3648,8 +3692,16 @@ function _mapOrderForShop(r){
 // GET /api/shop/my-orders — طلبات الاستلام من المحل
 app.get('/api/shop/my-orders', shopAuth, async (req, res) => {
   try{
+    // اختر الأعمدة بدل * لتجنب الـ awb_base64 الضخم
+    const COLS = `id, shopify_id, src, name, phone, area, addr, addr2, governorate, city,
+                  total, ship, paid, status, delivery_type, items, picked_up_at,
+                  courier_delivered_at, payment_change_requested, transfer_requested_at,
+                  cancelled_by_field, cancelled_at, cancellation_reason, cancellation_received_at,
+                  order_note, customer_note, courier_note, created_at, updated_at, merged_into,
+                  courier_id`;
+
     const r = await pool.query(
-      `SELECT * FROM orders
+      `SELECT ${COLS} FROM orders
        WHERE delivery_type='pickup'
          AND (merged_into IS NULL OR merged_into = '')
          AND (transfer_requested_at IS NULL)
@@ -3658,7 +3710,7 @@ app.get('/api/shop/my-orders', shopAuth, async (req, res) => {
        ORDER BY created_at ASC`
     );
     const todayR = await pool.query(
-      `SELECT * FROM orders
+      `SELECT ${COLS} FROM orders
        WHERE delivery_type='pickup'
          AND status IN ('مكتمل', 'ملغي')
          AND updated_at::date = CURRENT_DATE
@@ -3673,7 +3725,7 @@ app.get('/api/shop/my-orders', shopAuth, async (req, res) => {
 
     // ✨ الإلغاءات بانتظار استلام الإدارة
     const cancelledR = await pool.query(
-      `SELECT * FROM orders
+      `SELECT ${COLS} FROM orders
        WHERE delivery_type='pickup'
          AND cancelled_by_field=true
          AND cancellation_received_at IS NULL
