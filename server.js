@@ -372,7 +372,7 @@ async function initDB() {
     // ===== v60: امسح invoice cache عشان الفواتير القديمة تتعمل regenerate مع QR code =====
     try {
       const lastVerRes = await pool.query(`SELECT value FROM app_settings WHERE key='last_invoice_template_version'`);
-      const currentTpl = 'qr-v1';
+      const currentTpl = 'qr-v2-server-img';  // server-side QR via quickchart.io
       if (lastVerRes.rows[0]?.value !== currentTpl) {
         const cleared = await pool.query('DELETE FROM invoice_cache RETURNING order_id');
         await pool.query(
@@ -1736,7 +1736,9 @@ async function generateInvoiceHtml(order, couriersArr) {
         <div>${orderDate}</div>
         ${order.batch_code || order.batchCode ? `<div style="font-size:10px;color:#6b7280;margin-top:2px">${order.batch_code || order.batchCode}</div>`:''}
       </div>
-      <div class="order-qr" id="orderQR" data-order="${(order.id||'').replace(/"/g,'')}"></div>
+      <div class="order-qr">
+        <img src="https://quickchart.io/qr?text=${encodeURIComponent(order.id || '')}&size=156&margin=1&ecLevel=M" alt="QR" style="width:100%;height:100%;display:block" onerror="this.style.display='none'">
+      </div>
     </div>
   </div>
   <div class="ship-to">
@@ -1770,36 +1772,6 @@ async function generateInvoiceHtml(order, couriersArr) {
     <button class="print-btn no-print" onclick="window.print()">Print / Save PDF</button>
   </div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
-<script>
-(function(){
-  function renderQR(){
-    var el = document.getElementById('orderQR');
-    if(!el || !window.QRCode) return;
-    var data = el.getAttribute('data-order') || '';
-    if(!data) return;
-    // عمل canvas مؤقت ثم تحويله لـ data URL
-    QRCode.toDataURL(data, { width: 156, margin: 0, errorCorrectionLevel: 'M' }, function(err, url){
-      if(err){ console.warn('QR error:', err); return; }
-      var img = document.createElement('img');
-      img.src = url;
-      img.style.width = '100%';
-      img.style.height = '100%';
-      img.style.display = 'block';
-      el.innerHTML = '';
-      el.appendChild(img);
-    });
-  }
-  if(document.readyState === 'loading'){
-    document.addEventListener('DOMContentLoaded', renderQR);
-  } else {
-    renderQR();
-  }
-  // لو الـ library لسه بتحمّل، استنى وحاول تاني
-  setTimeout(renderQR, 500);
-  setTimeout(renderQR, 1500);
-})();
-</script>
 </body></html>`;
 }
 
@@ -2366,7 +2338,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v64-2026-04-25-overscan';
+const SERVER_VERSION = 'v65-2026-04-25-qr-img';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
