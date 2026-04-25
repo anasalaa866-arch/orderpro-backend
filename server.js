@@ -2294,7 +2294,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v56-2026-04-25-shopfix';
+const SERVER_VERSION = 'v57-2026-04-25-routes';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -2319,6 +2319,23 @@ app.get('/', async (req, res) => {
     preparationSystem: hasPreparation ? '✅ migrated' : '❌ migration needed',
     shopCourierId,
     uptime: Math.floor(process.uptime()) + ' ثانية'
+  });
+});
+
+// ===== Diagnostic: list all registered routes =====
+app.get('/api/_routes', (req, res) => {
+  const routes = [];
+  app._router.stack.forEach(layer => {
+    if (layer.route) {
+      const methods = Object.keys(layer.route.methods).map(m => m.toUpperCase()).join(',');
+      routes.push(`${methods} ${layer.route.path}`);
+    }
+  });
+  res.json({
+    version: SERVER_VERSION,
+    totalRoutes: routes.length,
+    hasPreparationOrders: routes.some(r => r.includes('/api/preparation/orders')),
+    routes: routes.sort()
   });
 });
 
