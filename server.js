@@ -4428,18 +4428,31 @@ app.get('/api/preparation/orders', async (req, res) => {
   if (!DB_ENABLED) return res.json({ orders: [] });
   const { preparerId } = req.query;
   try {
-    const result = await pool.query('SELECT o.*, c.name as courier_name FROM orders o LEFT JOIN couriers c ON o.courier_id = c.id WHERE (o.preparation_status IS NULL OR o.preparation_status = $1) AND o.status != $2 AND (o.preparation_started_by IS NULL OR o.preparation_started_by = $3) ORDER BY o.created_at ASC LIMIT 100', ['in_progress', 'ملغي', preparerId]);
+    // SELECT أعمدة معينة بس (ليس *) عشان نتجنب bosta_awb_base64 الضخم
+    // وفلترة أدق: الطلبات اللي محتاجة تحضير فقط (مش completed)، ومش ملغية
+    const result = await pool.query(`
+      SELECT o.id, o.shopify_id, o.name, o.phone, o.area, o.addr, o.total, o.paid,
+             o.items, o.scanned_items, o.status, o.created_at,
+             o.preparation_status, o.preparation_started_by, o.preparation_started_at
+      FROM orders o
+      WHERE (o.preparation_status IS NULL OR o.preparation_status = 'in_progress')
+        AND o.status NOT IN ('ملغي', 'مسوّى')
+        AND (o.preparation_started_by IS NULL OR o.preparation_started_by = $1)
+      ORDER BY o.created_at DESC
+      LIMIT 50
+    `, [preparerId]);
     const orders = result.rows.map(row => ({
       id: row.id,
       shopifyId: row.shopify_id,
-      orderNumber: row.order_number,
       name: row.name,
       phone: row.phone,
-      address: row.address,
+      area: row.area,
+      addr: row.addr,
       total: parseFloat(row.total) || 0,
       paid: row.paid || false,
       items: row.items,
       scannedItems: row.scanned_items,
+      status: row.status,
       preparationStatus: row.preparation_status,
       preparationStartedBy: row.preparation_started_by,
       preparationStartedAt: row.preparation_started_at,
