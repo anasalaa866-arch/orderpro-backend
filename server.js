@@ -642,9 +642,11 @@ app.post('/webhook/shopify', async (req, res) => {
           END,
           updated_at=NOW(),
           -- حدّث status بس لو الطلب ملغي على Shopify، أو لو لسه مش موزع
+          -- نحافظ على أي status نهائي/متوسط — بس Shopify cancellation يقدر يلغي
           status=CASE
             WHEN EXCLUDED.status='ملغي' THEN 'ملغي'
-            WHEN orders.status IN ('جاري التوصيل','مكتمل','ملغي') THEN orders.status
+            WHEN orders.status IN ('جاري التوصيل','مكتمل','ملغي','تحت التسوية','مسوّى','مرتجع','ملغي بالميدان','مدمج','تم التسليم') THEN orders.status
+            WHEN orders.courier_id IS NOT NULL THEN orders.status
             ELSE EXCLUDED.status
           END
       `, [o.id, o.shopify_id, o.src, o.name, o.phone, o.area, o.addr, o.addr2||'', o.total,
@@ -2376,7 +2378,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v67-2026-04-25-cols';
+const SERVER_VERSION = 'v68-2026-04-25-status-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
