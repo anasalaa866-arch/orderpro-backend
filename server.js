@@ -2366,7 +2366,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v62-2026-04-25-barcode';
+const SERVER_VERSION = 'v63-2026-04-25-5days';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -4601,19 +4601,22 @@ app.get('/api/preparation/orders', async (req, res) => {
   }
   try {
     // الفلترة:
-    // 1. الطلب لسه في المخزن (جديد أو تم التعيين) — مش جاري التوصيل ولا مكتمل
-    // 2. لم يتم تحضيره (preparation_status IS NULL) أو الشخص ده اللي بدأ تحضيره
-    // 3. مش ملغي
+    // 1. الطلب من آخر 5 أيام
+    // 2. مش متحضّر بالفعل (preparation_status != 'completed')
+    // 3. لو في طلب شغال عليه محضر، يظهر بس لصاحبه (مش لباقي المحضرين)
+    // 4. مش ملغي
     const result = await pool.query(`
       SELECT o.id, o.shopify_id, o.name, o.phone, o.area, o.addr, o.total, o.paid,
              o.items, o.line_items_json, o.scanned_items, o.status, o.created_at,
              o.preparation_status, o.preparation_started_by, o.preparation_started_at,
              o.courier_id
       FROM orders o
-      WHERE o.status IN ('جديد', 'تم التعيين')
-        AND (o.preparation_status IS NULL OR (o.preparation_status = 'in_progress' AND o.preparation_started_by = $1))
+      WHERE o.created_at >= NOW() - INTERVAL '5 days'
+        AND o.status != 'ملغي'
+        AND (o.preparation_status IS NULL
+             OR (o.preparation_status = 'in_progress' AND o.preparation_started_by = $1))
       ORDER BY o.created_at DESC
-      LIMIT 50
+      LIMIT 200
     `, [preparerId]);
     const orders = result.rows.map(row => ({
       id: row.id,
@@ -4704,6 +4707,31 @@ app.get('/api/preparation/find/:id', async (req, res) => {
     });
   } catch (e) {
     console.error('Find prep order error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// /api/preparation/manual-mark — تأكيد يدوي لمنتج بدون باركود
+app.post('/api/preparation/manual-mark', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ ok: true });
+  const { orderId, itemKey, quantity, preparerId } = req.body;
+  if (!orderId || !itemKey) return res.status(400).json({ error: 'orderId and itemKey required' });
+  try {
+    const r = await pool.query('SELECT scanned_items FROM orders WHERE id=$1', [orderId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Order not found' });
+    let scannedItems = {};
+    try { scannedItems = r.rows[0].scanned_items ? JSON.parse(r.rows[0].scanned_items) : {}; } catch(e) {}
+    scannedItems[itemKey] = quantity || 1;
+    await pool.query('UPDATE orders SET scanned_items=$1, updated_at=NOW() WHERE id=$2',
+      [JSON.stringify(scannedItems), orderId]);
+    await pool.query(
+      'INSERT INTO order_history (order_id, action, user_name, new_value) VALUES ($1, $2, $3, $4)',
+      [orderId, 'item_manual_marked', 'Preparer #' + preparerId, itemKey + ' x' + (quantity || 1)]
+    ).catch(() => {});
+    console.log('Manual mark:', itemKey, 'for order', orderId, 'by preparer', preparerId);
+    res.json({ ok: true, scannedItems });
+  } catch (e) {
+    console.error('Manual mark error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
