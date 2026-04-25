@@ -369,6 +369,23 @@ async function initDB() {
       console.error('❌ Shop courier auto-seed FAILED:', e.message, e.stack);
     }
 
+    // ===== v60: امسح invoice cache عشان الفواتير القديمة تتعمل regenerate مع QR code =====
+    try {
+      const lastVerRes = await pool.query(`SELECT value FROM app_settings WHERE key='last_invoice_template_version'`);
+      const currentTpl = 'qr-v1';
+      if (lastVerRes.rows[0]?.value !== currentTpl) {
+        const cleared = await pool.query('DELETE FROM invoice_cache RETURNING order_id');
+        await pool.query(
+          `INSERT INTO app_settings (key, value) VALUES ('last_invoice_template_version', $1)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+          [currentTpl]
+        );
+        console.log(`✅ Invoice cache cleared (${cleared.rowCount} entries) — template upgraded to ${currentTpl}`);
+      }
+    } catch(e) {
+      console.warn('Invoice cache clear skipped:', e.message);
+    }
+
   } catch (err) {
     console.error('❌ DB init error:', err.message);
   }
@@ -1697,8 +1714,10 @@ async function generateInvoiceHtml(order, couriersArr) {
   .wrapper{width:831px;margin:auto;padding:3em}
   .header{display:flex;justify-content:space-between;align-items:start;margin-bottom:20px}
   .brand{font-size:28px;font-weight:800}
-  .order-info{text-align:left;font-size:13px}
+  .order-info{text-align:left;font-size:13px;display:flex;align-items:center;gap:14px}
   .order-info .code{font-weight:700}
+  .order-qr{width:78px;height:78px;flex-shrink:0}
+  .order-qr svg{width:100%;height:100%;display:block}
   .ship-to{margin-bottom:20px}
   .ship-label{font-size:11px;font-weight:700;text-transform:uppercase;margin-bottom:6px}
   .summary-box{margin:1.2em 0.7em 0;border:1.5px solid #000;border-radius:4px;padding:10px 14px;font-size:11px;page-break-inside:avoid;break-inside:avoid}
@@ -1710,7 +1729,14 @@ async function generateInvoiceHtml(order, couriersArr) {
 <div class="wrapper">
   <div class="header">
     <div class="brand">CAFELAX</div>
-    <div class="order-info"><div class="code">Order ${orderNum}</div><div>${orderDate}</div>${order.batch_code || order.batchCode ? `<div style="font-size:10px;color:#6b7280;margin-top:2px">${order.batch_code || order.batchCode}</div>`:''}</div>
+    <div class="order-info">
+      <div>
+        <div class="code">Order ${orderNum}</div>
+        <div>${orderDate}</div>
+        ${order.batch_code || order.batchCode ? `<div style="font-size:10px;color:#6b7280;margin-top:2px">${order.batch_code || order.batchCode}</div>`:''}
+      </div>
+      <div class="order-qr" id="orderQR" data-order="${(order.id||'').replace(/"/g,'')}"></div>
+    </div>
   </div>
   <div class="ship-to">
     <div class="ship-label">Ship to</div>
@@ -1743,6 +1769,36 @@ async function generateInvoiceHtml(order, couriersArr) {
     <button class="print-btn no-print" onclick="window.print()">Print / Save PDF</button>
   </div>
 </div>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+<script>
+(function(){
+  function renderQR(){
+    var el = document.getElementById('orderQR');
+    if(!el || !window.QRCode) return;
+    var data = el.getAttribute('data-order') || '';
+    if(!data) return;
+    // عمل canvas مؤقت ثم تحويله لـ data URL
+    QRCode.toDataURL(data, { width: 156, margin: 0, errorCorrectionLevel: 'M' }, function(err, url){
+      if(err){ console.warn('QR error:', err); return; }
+      var img = document.createElement('img');
+      img.src = url;
+      img.style.width = '100%';
+      img.style.height = '100%';
+      img.style.display = 'block';
+      el.innerHTML = '';
+      el.appendChild(img);
+    });
+  }
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', renderQR);
+  } else {
+    renderQR();
+  }
+  // لو الـ library لسه بتحمّل، استنى وحاول تاني
+  setTimeout(renderQR, 500);
+  setTimeout(renderQR, 1500);
+})();
+</script>
 </body></html>`;
 }
 
