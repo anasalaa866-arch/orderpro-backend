@@ -39,6 +39,188 @@ function httpsRequest(url, options={}, body=null) {
     req.end();
   });
 }
+
+// ===== STATE VALIDATION SYSTEM =====
+
+const STATE_MACHINE = {
+  'جديد': ['تم التعيين', 'ملغي'],
+  'تم التعيين': ['جاري التوصيل', 'جديد', 'ملغي'],
+  'جاري التوصيل': ['تم التسليم', 'مرتجع', 'تم التعيين'],
+  'تم التسليم': ['تحت التسوية'],
+  'مرتجع': ['تحت التسوية', 'جديد'],
+  'تحت التسوية': ['مسوّى', 'تم التسليم'],
+  'مسوّى': [],
+  'ملغي': []
+};
+
+function validateStateTransition(currentStatus, newStatus) {
+  if (currentStatus === newStatus) return { valid: true };
+  const allowed = STATE_MACHINE[currentStatus] || [];
+  if (!allowed.includes(newStatus)) {
+    return {
+      valid: false,
+      error: `لا يمكن تغيير الحالة من "${currentStatus}" إلى "${newStatus}"`
+    };
+  }
+  return { valid: true };
+}
+
+function canSettle(order) {
+  if (!order) return { valid: false, error: 'الطلب غير موجود' };
+  
+  const validStatuses = ['تم التسليم', 'مرتجع'];
+  if (!validStatuses.includes(order.status)) {
+    return {
+      valid: false,
+      error: `لا يمكن تسوية طلب بحالة "${order.status}". يجب أن يكون "تم التسليم" أو "مرتجع"`
+    };
+  }
+  
+  if (!order.courier_id) {
+    return { valid: false, error: 'الطلب غير معيّن لمندوب' };
+  }
+  
+  if (order.courier_delivered_at && order.status === 'تم التسليم') {
+    return { valid: true };
+  }
+  
+  if (order.courier_returned_at && order.status === 'مرتجع') {
+    return { valid: true };
+  }
+  
+  return { valid: false, error: 'بيانات التسليم غير مكتملة' };
+}
+
+function courierCanDeliver(order, courierId) {
+  if (!order) return { valid: false, error: 'الطلب غير موجود' };
+  
+  if (order.status !== 'جاري التوصيل') {
+    return {
+      valid: false,
+      error: `لا يمكن تسليم طلب بحالة "${order.status}". يجب أن يكون "جاري التوصيل"`
+    };
+  }
+  
+  if (String(order.courier_id) !== String(courierId)) {
+    return {
+      valid: false,
+      error: 'هذا الطلب غير معيّن لك'
+    };
+  }
+  
+  return { valid: true };
+}
+
+// Add validation endpoint
+app.get('/api/orders/:id/state-info', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ error: 'Database not enabled' });
+  
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'SELECT id, status, courier_id, courier_delivered_at, courier_returned_at FROM orders WHERE id = $1',
+      [id]
+    );
+    
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    const order = result.rows[0];
+    const allowedTransitions = STATE_MACHINE[order.status] || [];
+    const canSettleResult = canSettle(order);
+    
+    res.json({
+      orderId: id,
+      currentStatus: order.status,
+      allowedTransitions,
+      canSettle: canSettleResult.valid,
+      settleError: canSettleResult.error,
+      courierId: order.courier_id,
+      deliveredAt: order.courier_delivered_at,
+      returnedAt: order.courier_returned_at
+    });
+    
+  } catch (e) {
+    console.error('State info error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Add admin override endpoint
+app.post('/api/orders/:id/fix-state', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ ok: true });
+  
+  try {
+    const { id } = req.params;
+    const { newStatus, adminName, reason } = req.body;
+    
+    if (!newStatus || !adminName || !reason) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    // Get current order
+    const result = await pool.query('SELECT * FROM orders WHERE id = $1', [id]);
+    if (!result.rows.length) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    const order = result.rows[0];
+    
+    // Update status
+    await pool.query(
+      'UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2',
+      [newStatus, id]
+    );
+    
+    // Log admin override
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, old_value, new_value, notes)
+       VALUES ($1, 'admin_state_override', $2, $3, $4, $5)`,
+      [id, adminName, order.status, newStatus, reason]
+    ).catch(() => {});
+    
+    console.log(`⚠️ Admin override: Order ${id} ${order.status} → ${newStatus} by ${adminName}: ${reason}`);
+    
+    res.json({ ok: true });
+    
+  } catch (e) {
+    console.error('Fix state error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Wrap existing order update endpoint with validation
+const originalOrderPatch = app._router.stack.find(
+  r => r.route && r.route.path === '/api/orders/:id' && r.route.methods.patch
+);
+
+if (originalOrderPatch) {
+  const originalHandler = originalOrderPatch.route.stack[0].handle;
+  
+  originalOrderPatch.route.stack[0].handle = async (req, res, next) => {
+    if (req.body.status) {
+      try {
+        const { id } = req.params;
+        const result = await pool.query('SELECT status FROM orders WHERE id = $1', [id]);
+        
+        if (result.rows.length) {
+          const currentStatus = result.rows[0].status;
+          const validation = validateStateTransition(currentStatus, req.body.status);
+          
+          if (!validation.valid) {
+            return res.status(400).json({ error: validation.error });
+          }
+        }
+      } catch (e) {
+        console.error('Validation error:', e);
+      }
+    }
+    
+    return originalHandler(req, res, next);
+  };
+}
+
 const PORT = process.env.PORT || 3000;
 
 // ===== DATABASE =====
@@ -4253,3 +4435,120 @@ app.delete('/api/check-suppliers/:id', async (req, res) => {
     res.json({ok:true});
   }catch(e){ res.json({ok:false}); }
 });
+
+// ===== BARCODE VERIFICATION SYSTEM - ENDPOINTS =====
+
+app.post('/api/preparation/start', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ ok: true });
+  const { orderId, preparerId } = req.body;
+  if (!orderId || !preparerId) return res.status(400).json({ error: 'orderId and preparerId required' });
+  try {
+    await pool.query(`UPDATE orders SET preparation_started_by=$1, preparation_started_at=NOW(), preparation_status='in_progress', updated_at=NOW() WHERE id=$2`, [preparerId, orderId]);
+    await pool.query(`INSERT INTO order_history (order_id, action, user_name, new_value) VALUES ($1, 'preparation_started', $2, 'in_progress')`, [orderId, 'Preparer #' + preparerId]).catch(() => {});
+    console.log(\`✅ Order \${orderId} preparation started by \${preparerId}\`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('❌ Preparation start error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/preparation/scan', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ ok: true, matched: true });
+  const { orderId, barcode, preparerId } = req.body;
+  if (!orderId || !barcode) return res.status(400).json({ error: 'orderId and barcode required' });
+  try {
+    const orderRes = await pool.query('SELECT id, items, scanned_items FROM orders WHERE id=$1', [orderId]);
+    if (!orderRes.rows.length) return res.status(404).json({ error: 'Order not found' });
+    const order = orderRes.rows[0];
+    const items = order.items ? JSON.parse(order.items) : [];
+    const scannedItems = order.scanned_items ? JSON.parse(order.scanned_items) : {};
+    let matched = false, matchedItem = null;
+    for (const item of items) {
+      if (!item.barcode) continue;
+      const barcodes = item.barcode.split(',').map(b => b.trim());
+      if (barcodes.includes(barcode)) {
+        matched = true;
+        matchedItem = item;
+        const itemKey = item.sku || item.name;
+        scannedItems[itemKey] = (scannedItems[itemKey] || 0) + 1;
+        break;
+      }
+    }
+    if (!matched) {
+      console.log(\`❌ Barcode \${barcode} not found in order \${orderId}\`);
+      return res.json({ ok: true, matched: false, error: 'الباركود غير موجود في الطلب' });
+    }
+    await pool.query(`UPDATE orders SET scanned_items=$1, updated_at=NOW() WHERE id=$2`, [JSON.stringify(scannedItems), orderId]);
+    await pool.query(`INSERT INTO order_history (order_id, action, user_name, new_value) VALUES ($1, 'barcode_scanned', $2, $3)`, [orderId, 'Preparer #' + preparerId, barcode]).catch(() => {});
+    console.log(\`✅ Barcode \${barcode} scanned for order \${orderId}\`);
+    res.json({ ok: true, matched: true, item: matchedItem, scannedItems });
+  } catch (e) {
+    console.error('❌ Scan error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/preparation/complete', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ ok: true });
+  const { orderId, preparerId, preparerName } = req.body;
+  if (!orderId || !preparerId) return res.status(400).json({ error: 'orderId and preparerId required' });
+  try {
+    const orderRes = await pool.query('SELECT id, items, scanned_items, shopify_id FROM orders WHERE id=$1', [orderId]);
+    if (!orderRes.rows.length) return res.status(404).json({ error: 'Order not found' });
+    const order = orderRes.rows[0];
+    const items = order.items ? JSON.parse(order.items) : [];
+    const scannedItems = order.scanned_items ? JSON.parse(order.scanned_items) : {};
+    let allScanned = true;
+    const missing = [];
+    for (const item of items) {
+      const itemKey = item.sku || item.name;
+      const scannedQty = scannedItems[itemKey] || 0;
+      const requiredQty = item.quantity || 1;
+      if (scannedQty < requiredQty) {
+        allScanned = false;
+        missing.push({ name: item.name, required: requiredQty, scanned: scannedQty, missing: requiredQty - scannedQty });
+      }
+    }
+    if (!allScanned) {
+      console.log(\`⚠️ Order \${orderId} incomplete - missing items:\`, missing);
+      return res.status(400).json({ error: 'الطلب غير مكتمل', missing });
+    }
+    await pool.query(`UPDATE orders SET preparation_status='completed', preparation_completed_at=NOW(), preparation_completed_by=$1, updated_at=NOW() WHERE id=$2`, [preparerId, orderId]);
+    await pool.query(`INSERT INTO order_history (order_id, action, user_name, new_value) VALUES ($1, 'preparation_completed', $2, 'completed')`, [orderId, 'Preparer: ' + (preparerName || preparerId)]).catch(() => {});
+    console.log(\`✅ Order \${orderId} preparation completed by \${preparerName || preparerId}\`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('❌ Complete preparation error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/preparation/orders', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ orders: [] });
+  const { preparerId } = req.query;
+  try {
+    const result = await pool.query(\`SELECT o.*, c.name as courier_name, u.name as preparer_name FROM orders o LEFT JOIN couriers c ON o.courier_id = c.id LEFT JOIN users u ON o.preparation_completed_by = u.id WHERE (o.preparation_status IS NULL OR o.preparation_status = 'in_progress') AND o.status != 'ملغي' AND (o.preparation_started_by IS NULL OR o.preparation_started_by = $1) ORDER BY o.created_at ASC LIMIT 100\`, [preparerId]);
+    const orders = result.rows.map(row => ({
+      id: row.id,
+      shopifyId: row.shopify_id,
+      orderNumber: row.order_number,
+      name: row.name,
+      phone: row.phone,
+      address: row.address,
+      total: parseFloat(row.total) || 0,
+      paid: row.paid || false,
+      items: row.items,
+      scannedItems: row.scanned_items,
+      preparationStatus: row.preparation_status,
+      preparationStartedBy: row.preparation_started_by,
+      preparationStartedAt: row.preparation_started_at,
+      createdAt: row.created_at
+    }));
+    res.json({ orders });
+  } catch (e) {
+    console.error('❌ Get preparation orders error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
