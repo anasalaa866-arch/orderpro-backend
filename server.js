@@ -2294,7 +2294,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v57-2026-04-25-routes';
+const SERVER_VERSION = 'v58-2026-04-25-FIXED';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -4345,6 +4345,7 @@ app.delete('/api/check-suppliers/:id', async (req, res) => {
     await pool.query('DELETE FROM check_suppliers WHERE id=$1', [req.params.id]);
     res.json({ok:true});
   }catch(e){ res.json({ok:false}); }
+});
 
 // ===== BARCODE VERIFICATION SYSTEM =====
 
@@ -4602,6 +4603,4 @@ app.post('/api/orders/:id/fix-state', async (req, res) => {
     console.error('Fix state error:', e);
     res.status(500).json({ error: e.message });
   }
-});
-
 });
