@@ -2294,7 +2294,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v58-2026-04-25-FIXED';
+const SERVER_VERSION = 'v59-2026-04-25-items';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -4369,16 +4369,20 @@ app.post('/api/preparation/scan', async (req, res) => {
   const { orderId, barcode, preparerId } = req.body;
   if (!orderId || !barcode) return res.status(400).json({ error: 'orderId and barcode required' });
   try {
-    const orderRes = await pool.query('SELECT id, items, scanned_items FROM orders WHERE id=$1', [orderId]);
+    const orderRes = await pool.query('SELECT id, items, line_items_json, scanned_items FROM orders WHERE id=$1', [orderId]);
     if (!orderRes.rows.length) return res.status(404).json({ error: 'Order not found' });
     const order = orderRes.rows[0];
-    const items = order.items ? JSON.parse(order.items) : [];
-    const scannedItems = order.scanned_items ? JSON.parse(order.scanned_items) : {};
+    // استخدم line_items_json (تفاصيل كاملة)، وارجع لـ items لو فاضي
+    let items = [];
+    try { items = JSON.parse(order.line_items_json || order.items || '[]'); } catch(e) { items = []; }
+    if (!Array.isArray(items)) items = [];
+    let scannedItems = {};
+    try { scannedItems = order.scanned_items ? JSON.parse(order.scanned_items) : {}; } catch(e) {}
     let matched = false;
     let matchedItem = null;
     for (const item of items) {
       if (!item.barcode) continue;
-      const barcodes = item.barcode.split(',').map(b => b.trim());
+      const barcodes = String(item.barcode).split(',').map(b => b.trim()).filter(b => b);
       if (barcodes.includes(barcode)) {
         matched = true;
         matchedItem = item;
@@ -4406,11 +4410,14 @@ app.post('/api/preparation/complete', async (req, res) => {
   const { orderId, preparerId, preparerName } = req.body;
   if (!orderId || !preparerId) return res.status(400).json({ error: 'orderId and preparerId required' });
   try {
-    const orderRes = await pool.query('SELECT id, items, scanned_items, shopify_id FROM orders WHERE id=$1', [orderId]);
+    const orderRes = await pool.query('SELECT id, items, line_items_json, scanned_items, shopify_id FROM orders WHERE id=$1', [orderId]);
     if (!orderRes.rows.length) return res.status(404).json({ error: 'Order not found' });
     const order = orderRes.rows[0];
-    const items = order.items ? JSON.parse(order.items) : [];
-    const scannedItems = order.scanned_items ? JSON.parse(order.scanned_items) : {};
+    let items = [];
+    try { items = JSON.parse(order.line_items_json || order.items || '[]'); } catch(e) { items = []; }
+    if (!Array.isArray(items)) items = [];
+    let scannedItems = {};
+    try { scannedItems = order.scanned_items ? JSON.parse(order.scanned_items) : {}; } catch(e) {}
     let allScanned = true;
     const missing = [];
     for (const item of items) {
@@ -4476,7 +4483,7 @@ app.get('/api/preparation/orders', async (req, res) => {
     // وفلترة أدق: الطلبات اللي محتاجة تحضير فقط (مش completed)، ومش ملغية
     const result = await pool.query(`
       SELECT o.id, o.shopify_id, o.name, o.phone, o.area, o.addr, o.total, o.paid,
-             o.items, o.scanned_items, o.status, o.created_at,
+             o.items, o.line_items_json, o.scanned_items, o.status, o.created_at,
              o.preparation_status, o.preparation_started_by, o.preparation_started_at
       FROM orders o
       WHERE (o.preparation_status IS NULL OR o.preparation_status = 'in_progress')
@@ -4494,7 +4501,8 @@ app.get('/api/preparation/orders', async (req, res) => {
       addr: row.addr,
       total: parseFloat(row.total) || 0,
       paid: row.paid || false,
-      items: row.items,
+      // فضّل line_items_json (التفاصيل الكاملة) على items (الوصف البسيط)
+      items: row.line_items_json || row.items,
       scannedItems: row.scanned_items,
       status: row.status,
       preparationStatus: row.preparation_status,
