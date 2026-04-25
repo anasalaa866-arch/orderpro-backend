@@ -313,11 +313,56 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_received_at TIMESTAMPTZ",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS cancellation_received_by TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_sequence INTEGER", // ترتيب التوصيل للمندوب
+
+      // ===== v177: Preparation (Barcode) System =====
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS preparation_status VARCHAR(50)",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS preparation_started_by INTEGER",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS preparation_started_at TIMESTAMPTZ",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS preparation_completed_by INTEGER",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS preparation_completed_at TIMESTAMPTZ",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS scanned_items TEXT",
+      "CREATE INDEX IF NOT EXISTS idx_orders_preparation_status ON orders(preparation_status)",
+      "CREATE INDEX IF NOT EXISTS idx_orders_preparation_started_by ON orders(preparation_started_by)",
+      "ALTER TABLE couriers ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'courier'",
+      "UPDATE couriers SET role = 'courier' WHERE role IS NULL",
     ];
     for (const sql of migrations) {
       try { await pool.query(sql); } catch(e) {}
     }
     console.log('✅ Migrations applied');
+
+    // ===== v177: Auto-seed shop courier + setting =====
+    try {
+      // 1) دور على المحل لو موجود (role='shop' أو phone='shop')
+      let shopId = null;
+      const existing = await pool.query(
+        `SELECT id FROM couriers WHERE role = 'shop' OR phone = 'shop' LIMIT 1`
+      );
+      if (existing.rows.length) {
+        shopId = existing.rows[0].id;
+      } else {
+        // 2) لو مش موجود، اعمله
+        const ins = await pool.query(
+          `INSERT INTO couriers (name, phone, email, role, active)
+           VALUES ('المحل - Trivium Square', 'shop', 'shop@cafelax.com', 'shop', true)
+           RETURNING id`
+        );
+        shopId = ins.rows[0]?.id;
+        console.log('✅ Shop courier created with ID:', shopId);
+      }
+      // 3) احفظ shop_courier_id في app_settings
+      if (shopId) {
+        await pool.query(
+          `INSERT INTO app_settings (key, value)
+           VALUES ('shop_courier_id', $1)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+          [String(shopId)]
+        );
+        console.log('✅ shop_courier_id setting:', shopId);
+      }
+    } catch (e) {
+      console.log('⚠️ Shop courier auto-seed skipped:', e.message);
+    }
 
   } catch (err) {
     console.error('❌ DB init error:', err.message);
@@ -2252,8 +2297,8 @@ app.get('/', async (req, res) => {
 });
 
 // ===== START =====
-if (DB_ENABLED) {
-  // ===== SETTLEMENTS API =====
+// (wrapper removed: each endpoint checks DB_ENABLED individually)
+// ===== SETTLEMENTS API =====
 
 // جيب كل تسويات مندوب
 app.get('/api/settlements/:courierId', async (req, res) => {
@@ -4105,7 +4150,9 @@ app.post('/api/field-cancellations/:orderId/revert', async (req, res) => {
 // ===== END: CAFELAX STARS ENDPOINTS =====
 // ============================================================
 
-initDB().then(() => {
+// Server startup
+if (DB_ENABLED) {
+  initDB().then(() => {
     app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT));
   });
 } else {
@@ -4312,7 +4359,7 @@ app.post('/api/preparation/complete', async (req, res) => {
   const { orderId, preparerId, preparerName } = req.body;
   if (!orderId || !preparerId) return res.status(400).json({ error: 'orderId and preparerId required' });
   try {
-    const orderRes = await pool.query('SELECT id, items, scanned_items FROM orders WHERE id=$1', [orderId]);
+    const orderRes = await pool.query('SELECT id, items, scanned_items, shopify_id FROM orders WHERE id=$1', [orderId]);
     if (!orderRes.rows.length) return res.status(404).json({ error: 'Order not found' });
     const order = orderRes.rows[0];
     const items = order.items ? JSON.parse(order.items) : [];
@@ -4334,8 +4381,37 @@ app.post('/api/preparation/complete', async (req, res) => {
     }
     await pool.query('UPDATE orders SET preparation_status=$1, preparation_completed_at=NOW(), preparation_completed_by=$2, updated_at=NOW() WHERE id=$3', ['completed', preparerId, orderId]);
     await pool.query('INSERT INTO order_history (order_id, action, user_name, new_value) VALUES ($1, $2, $3, $4)', [orderId, 'preparation_completed', 'Preparer: ' + (preparerName || preparerId), 'completed']).catch(() => {});
-    console.log('Preparation completed for order:', orderId, 'by:', preparerName || preparerId);
-    res.json({ ok: true });
+
+    // ===== Shopify tag: prepared_by_<name> =====
+    let tagResult = null;
+    if (order.shopify_id && preparerName) {
+      try {
+        const creds = await getShopifyCredentials();
+        if (creds.shopUrl && creds.accessToken) {
+          const host = creds.shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+          const tag = 'prepared_by_' + String(preparerName).trim().replace(/\s+/g, '_');
+          const getR = await shopifyRequest(host, creds.accessToken, `/admin/api/2024-10/orders/${order.shopify_id}.json?fields=id,tags`);
+          if (getR.status === 200 && getR.data.order) {
+            const currentTags = (getR.data.order.tags || '').split(',').map(t => t.trim()).filter(t => t);
+            if (!currentTags.includes(tag)) {
+              const newTags = [...currentTags, tag].join(', ');
+              const putR = await shopifyRequest(host, creds.accessToken,
+                `/admin/api/2024-10/orders/${order.shopify_id}.json`, 'PUT',
+                { order: { id: order.shopify_id, tags: newTags } });
+              tagResult = putR.status === 200 ? 'added' : 'failed_' + putR.status;
+            } else {
+              tagResult = 'already_exists';
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Shopify tag error:', e.message);
+        tagResult = 'error';
+      }
+    }
+
+    console.log('Preparation completed for order:', orderId, 'by:', preparerName || preparerId, 'tag:', tagResult);
+    res.json({ ok: true, shopifyTag: tagResult });
   } catch (e) {
     console.error('Complete preparation error:', e);
     res.status(500).json({ error: e.message });
@@ -4373,14 +4449,14 @@ app.get('/api/preparation/orders', async (req, res) => {
 // ===== STATE VALIDATION SYSTEM =====
 
 const STATE_MACHINE = {
-  'جديد': ['تم التعيين', 'ملغي'],
+  'جديد': ['تم التعيين', 'جاري التوصيل', 'ملغي'],
   'تم التعيين': ['جاري التوصيل', 'جديد', 'ملغي'],
-  'جاري التوصيل': ['تم التسليم', 'مرتجع', 'تم التعيين'],
-  'تم التسليم': ['تحت التسوية'],
-  'مرتجع': ['تحت التسوية', 'جديد'],
-  'تحت التسوية': ['مسوّى', 'تم التسليم'],
+  'جاري التوصيل': ['تم التسليم', 'تحت التسوية', 'مرتجع', 'تم التعيين', 'ملغي'],
+  'تم التسليم': ['تحت التسوية', 'مرتجع'],
+  'مرتجع': ['تحت التسوية', 'جديد', 'جاري التوصيل'],
+  'تحت التسوية': ['مسوّى', 'تم التسليم', 'جاري التوصيل', 'ملغي'],
   'مسوّى': [],
-  'ملغي': []
+  'ملغي': ['جديد']
 };
 
 function validateStateTransition(currentStatus, newStatus) {
