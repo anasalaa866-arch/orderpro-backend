@@ -910,6 +910,8 @@ app.get('/api/couriers', async (req, res) => {
     vehicle: r.vehicle, ship: parseFloat(r.ship), shipExpress: parseFloat(r.ship_express),
     status: r.status, settled: r.settled,
     settledAt: r.settled_at || null,
+    role: r.role || 'courier',
+    username: r.username || null,
   })) });
 });
 
@@ -937,7 +939,8 @@ app.patch('/api/couriers/:id', async (req, res) => {
     return res.json({ courier: c });
   }
   const map = { name:'name', phone:'phone', zone:'zone', vehicle:'vehicle',
-    ship:'ship', shipExpress:'ship_express', status:'status', settled:'settled', settledAt:'settled_at' };
+    ship:'ship', shipExpress:'ship_express', status:'status', settled:'settled', settledAt:'settled_at',
+    role:'role', email:'email', username:'username' };
   const sets = [], vals = [];
   Object.entries(b).forEach(([k, v]) => {
     if (map[k]) { sets.push(`${map[k]}=$${vals.length+1}`); vals.push(v); }
@@ -2605,7 +2608,7 @@ app.post('/api/courier/login', async (req, res) => {
 
   try{
     const r = await pool.query(
-      `SELECT id, name, phone, zone, username FROM couriers
+      `SELECT id, name, phone, zone, username, role FROM couriers
        WHERE username=$1 AND password_hash=$2 AND (status IS NULL OR status != 'غير نشط')`,
       [username, passHash]
     );
@@ -2627,7 +2630,8 @@ app.post('/api/courier/login', async (req, res) => {
         name: courier.name,
         phone: courier.phone,
         zone: courier.zone,
-        username: courier.username
+        username: courier.username,
+        role: courier.role || 'courier'
       }
     });
   }catch(e){ res.status(500).json({error: e.message}); }
@@ -2637,11 +2641,13 @@ app.post('/api/courier/login', async (req, res) => {
 app.get('/api/courier/me', courierAuth, async (req, res) => {
   try{
     const r = await pool.query(
-      'SELECT id, name, phone, zone, username FROM couriers WHERE id=$1',
+      'SELECT id, name, phone, zone, username, role FROM couriers WHERE id=$1',
       [req.courierId]
     );
     if(!r.rows.length) return res.status(404).json({error: 'Courier not found'});
-    res.json(r.rows[0]);
+    const c = r.rows[0];
+    if (!c.role) c.role = 'courier';
+    res.json(c);
   }catch(e){ res.status(500).json({error: e.message}); }
 });
 
