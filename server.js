@@ -2366,7 +2366,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v63-2026-04-25-5days';
+const SERVER_VERSION = 'v64-2026-04-25-overscan';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -4490,6 +4490,7 @@ app.post('/api/preparation/scan', async (req, res) => {
     const allBarcodes = [];
     let matched = false;
     let matchedItem = null;
+    let exceededLimit = false;
 
     for (const item of items) {
       if (!item.barcode) continue;
@@ -4501,9 +4502,27 @@ app.post('/api/preparation/scan', async (req, res) => {
         matched = true;
         matchedItem = item;
         const itemKey = item.sku || item.name;
-        scannedItems[itemKey] = (scannedItems[itemKey] || 0) + 1;
+        const currentScanned = scannedItems[itemKey] || 0;
+        const requiredQty = item.quantity || 1;
+
+        // ✋ امنع الزيادة فوق الكمية المطلوبة
+        if (currentScanned >= requiredQty) {
+          exceededLimit = true;
+          break;
+        }
+
+        scannedItems[itemKey] = currentScanned + 1;
         break;
       }
+    }
+
+    if (exceededLimit) {
+      console.log('Barcode over-scan:', scannedBarcode, 'item:', matchedItem?.name, 'already at limit');
+      return res.json({
+        ok: true, matched: false,
+        error: `هذا المنتج تم سكانه بالكامل (${matchedItem?.quantity || 1}/${matchedItem?.quantity || 1}) — لا يمكن زيادة الكمية`,
+        item: matchedItem
+      });
     }
 
     if (!matched) {
@@ -4541,6 +4560,7 @@ app.post('/api/preparation/complete', async (req, res) => {
     try { scannedItems = order.scanned_items ? JSON.parse(order.scanned_items) : {}; } catch(e) {}
     let allScanned = true;
     const missing = [];
+    const overScanned = [];
     for (const item of items) {
       const itemKey = item.sku || item.name;
       const scannedQty = scannedItems[itemKey] || 0;
@@ -4548,11 +4568,21 @@ app.post('/api/preparation/complete', async (req, res) => {
       if (scannedQty < requiredQty) {
         allScanned = false;
         missing.push({ name: item.name, required: requiredQty, scanned: scannedQty, missing: requiredQty - scannedQty });
+      } else if (scannedQty > requiredQty) {
+        // over-scan! بنرجع رقم صحيح
+        allScanned = false;
+        overScanned.push({ name: item.name, required: requiredQty, scanned: scannedQty });
       }
     }
     if (!allScanned) {
-      console.log('Order incomplete:', orderId, 'missing:', missing);
-      return res.status(400).json({ error: 'الطلب غير مكتمل', missing });
+      console.log('Order not ready:', orderId, 'missing:', missing, 'over:', overScanned);
+      return res.status(400).json({
+        error: overScanned.length
+          ? 'تم سكان كمية زائدة لبعض المنتجات — أعد التحضير'
+          : 'الطلب غير مكتمل',
+        missing,
+        overScanned
+      });
     }
     await pool.query('UPDATE orders SET preparation_status=$1, preparation_completed_at=NOW(), preparation_completed_by=$2, updated_at=NOW() WHERE id=$3', ['completed', preparerId, orderId]);
     await pool.query('INSERT INTO order_history (order_id, action, user_name, new_value) VALUES ($1, $2, $3, $4)', [orderId, 'preparation_completed', 'Preparer: ' + (preparerName || preparerId), 'completed']).catch(() => {});
