@@ -326,6 +326,8 @@ async function initDB() {
       "ALTER TABLE couriers ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'courier'",
       "UPDATE couriers SET role = 'courier' WHERE role IS NULL",
       // v66: indexes حرجة لتحسين سرعة الـ /api/orders والـ /api/courier/my-orders
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS governorate TEXT",
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS city TEXT",
       "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_orders_courier_id ON orders(courier_id)",
       "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
@@ -2374,7 +2376,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v66-2026-04-25-perf';
+const SERVER_VERSION = 'v67-2026-04-25-cols';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
