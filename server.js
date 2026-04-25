@@ -2289,14 +2289,32 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
+const SERVER_VERSION = 'v55-2026-04-25';
 app.get('/', async (req, res) => {
-  let dbOk = false, orderCount = 0;
+  let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
     try { const r = await pool.query('SELECT COUNT(*) FROM orders'); orderCount = parseInt(r.rows[0].count); dbOk = true; } catch {}
+    // تحقق إن أعمدة التحضير موجودة
+    try {
+      const cols = await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name='orders' AND column_name='preparation_status'`);
+      hasPreparation = cols.rows.length > 0;
+    } catch {}
+    try {
+      const s = await pool.query(`SELECT value FROM app_settings WHERE key='shop_courier_id'`);
+      shopCourierId = s.rows[0]?.value || null;
+    } catch {}
   } else {
     orderCount = memOrders.length;
   }
-  res.json({ status: '✅ OrderPro Backend شغال', db: DB_ENABLED ? (dbOk ? '✅ متصل' : '❌ منفصل') : '⚠️ بدون DB', orders: orderCount, uptime: Math.floor(process.uptime()) + ' ثانية' });
+  res.json({
+    status: '✅ OrderPro Backend شغال',
+    version: SERVER_VERSION,
+    db: DB_ENABLED ? (dbOk ? '✅ متصل' : '❌ منفصل') : '⚠️ بدون DB',
+    orders: orderCount,
+    preparationSystem: hasPreparation ? '✅ migrated' : '❌ migration needed',
+    shopCourierId,
+    uptime: Math.floor(process.uptime()) + ' ثانية'
+  });
 });
 
 // ===== START =====
