@@ -523,6 +523,7 @@ function mapShopifyOrder(sh) {
       title: i.title,
       variantTitle: i.variant_title || '',
       sku: i.sku || '',
+      barcode: i.barcode || '',
       quantity: i.quantity,
       price: parseFloat(i.price) || 0,
       totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
@@ -2140,7 +2141,9 @@ async function enrichLineItemsWithImages(lineItems, host, accessToken) {
 
   const productImageCache = {};
   const variantImageCache = {};
-  const productIds = [...new Set(lineItems.filter(i => !(i.image && i.image.src)).map(i => i.product_id).filter(Boolean))];
+  const variantBarcodeCache = {};  // variant_id → barcode
+  const variantSkuCache = {};       // variant_id → sku (للـ fallback)
+  const productIds = [...new Set(lineItems.filter(i => !(i.image && i.image.src) || !i.barcode).map(i => i.product_id).filter(Boolean))];
 
   for (const pid of productIds) {
     try {
@@ -2154,19 +2157,32 @@ async function enrichLineItemsWithImages(lineItems, host, accessToken) {
             variantImageCache[vid] = img.src;
           });
         });
+        // اجمع باركود كل variant
+        (p.variants || []).forEach(v => {
+          if (v.id && v.barcode) variantBarcodeCache[v.id] = v.barcode;
+          if (v.id && v.sku) variantSkuCache[v.id] = v.sku;
+        });
       }
-    } catch(e) { console.warn('enrich product img:', pid, e.message); }
+    } catch(e) { console.warn('enrich product:', pid, e.message); }
   }
 
   return lineItems.map(i => {
     let imageUrl = (i.image && i.image.src) ? i.image.src : null;
     if (!imageUrl && i.variant_id && variantImageCache[i.variant_id]) imageUrl = variantImageCache[i.variant_id];
     if (!imageUrl && i.product_id && productImageCache[i.product_id]) imageUrl = productImageCache[i.product_id];
+
+    // الباركود: من الـ line item أولاً (نادراً ما يكون موجود)، وإلا من الـ variant
+    let barcode = i.barcode || '';
+    if (!barcode && i.variant_id && variantBarcodeCache[i.variant_id]) {
+      barcode = variantBarcodeCache[i.variant_id];
+    }
+
     return {
       name: i.name,
       title: i.title,
       variantTitle: i.variant_title || '',
-      sku: i.sku || '',
+      sku: i.sku || (i.variant_id && variantSkuCache[i.variant_id]) || '',
+      barcode: barcode,
       quantity: i.quantity,
       price: parseFloat(i.price) || 0,
       totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
@@ -2350,7 +2366,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v59-2026-04-25-items';
+const SERVER_VERSION = 'v62-2026-04-25-barcode';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -4410,6 +4426,40 @@ app.post('/api/preparation/start', async (req, res) => {
   const { orderId, preparerId } = req.body;
   if (!orderId || !preparerId) return res.status(400).json({ error: 'orderId and preparerId required' });
   try {
+    // اجلب الطلب أولاً لو محتاج enrich (line_items_json مفهاش barcode)
+    const orderRes = await pool.query('SELECT id, shopify_id, line_items_json, src FROM orders WHERE id=$1', [orderId]);
+    if (orderRes.rows.length) {
+      const order = orderRes.rows[0];
+      let lineItems = [];
+      try { lineItems = JSON.parse(order.line_items_json || '[]'); } catch(e) {}
+
+      // لو فيه line items من Shopify ومفيش barcodes، اعمل enrich
+      const hasShopifyId = order.shopify_id || order.src === 'shopify';
+      const hasAnyBarcode = lineItems.some(i => i.barcode);
+      const needsEnrich = hasShopifyId && lineItems.length > 0 && !hasAnyBarcode;
+
+      if (needsEnrich) {
+        try {
+          const creds = await getShopifyCredentials();
+          if (creds.shopUrl && creds.accessToken) {
+            const host = creds.shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+            // اجلب الطلب من Shopify عشان نجيب الـ variant_id الأصلي
+            const shR = await shopifyRequest(host, creds.accessToken,
+              `/admin/api/2024-10/orders/${order.shopify_id}.json?fields=line_items`);
+            if (shR.status === 200 && shR.data.order && shR.data.order.line_items) {
+              const enriched = await enrichLineItemsWithImages(shR.data.order.line_items, host, creds.accessToken);
+              await pool.query('UPDATE orders SET line_items_json=$1, updated_at=NOW() WHERE id=$2',
+                [JSON.stringify(enriched), orderId]);
+              console.log('✅ Enriched line items with barcodes for order:', orderId,
+                'barcodes found:', enriched.filter(i => i.barcode).length, '/', enriched.length);
+            }
+          }
+        } catch(e) {
+          console.warn('Auto-enrich failed for order', orderId, ':', e.message);
+        }
+      }
+    }
+
     await pool.query('UPDATE orders SET preparation_started_by=$1, preparation_started_at=NOW(), preparation_status=$2, updated_at=NOW() WHERE id=$3', [preparerId, 'in_progress', orderId]);
     await pool.query('INSERT INTO order_history (order_id, action, user_name, new_value) VALUES ($1, $2, $3, $4)', [orderId, 'preparation_started', 'Preparer #' + preparerId, 'in_progress']).catch(() => {});
     console.log('Preparation started for order:', orderId, 'by preparer:', preparerId);
@@ -4424,6 +4474,7 @@ app.post('/api/preparation/scan', async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true, matched: true });
   const { orderId, barcode, preparerId } = req.body;
   if (!orderId || !barcode) return res.status(400).json({ error: 'orderId and barcode required' });
+  const scannedBarcode = String(barcode).trim();
   try {
     const orderRes = await pool.query('SELECT id, items, line_items_json, scanned_items FROM orders WHERE id=$1', [orderId]);
     if (!orderRes.rows.length) return res.status(404).json({ error: 'Order not found' });
@@ -4434,12 +4485,19 @@ app.post('/api/preparation/scan', async (req, res) => {
     if (!Array.isArray(items)) items = [];
     let scannedItems = {};
     try { scannedItems = order.scanned_items ? JSON.parse(order.scanned_items) : {}; } catch(e) {}
+
+    // اجمع كل الباركودات المتاحة للـ debug
+    const allBarcodes = [];
     let matched = false;
     let matchedItem = null;
+
     for (const item of items) {
       if (!item.barcode) continue;
       const barcodes = String(item.barcode).split(',').map(b => b.trim()).filter(b => b);
-      if (barcodes.includes(barcode)) {
+      barcodes.forEach(b => allBarcodes.push(b));
+      // matching: exact أو case-insensitive للأمان
+      if (barcodes.includes(scannedBarcode) ||
+          barcodes.some(b => b.toLowerCase() === scannedBarcode.toLowerCase())) {
         matched = true;
         matchedItem = item;
         const itemKey = item.sku || item.name;
@@ -4447,13 +4505,20 @@ app.post('/api/preparation/scan', async (req, res) => {
         break;
       }
     }
+
     if (!matched) {
-      console.log('Barcode not found:', barcode, 'in order:', orderId);
-      return res.json({ ok: true, matched: false, error: 'الباركود غير موجود في الطلب' });
+      console.log('Barcode not found:', scannedBarcode, 'in order:', orderId, 'available:', allBarcodes);
+      return res.json({
+        ok: true, matched: false,
+        error: allBarcodes.length === 0
+          ? 'هذا الطلب ليس له باركودات محددة (تأكد من إضافة الباركود في Shopify)'
+          : 'الباركود غير موجود في الطلب',
+        debug: { scanned: scannedBarcode, availableCount: allBarcodes.length }
+      });
     }
     await pool.query('UPDATE orders SET scanned_items=$1, updated_at=NOW() WHERE id=$2', [JSON.stringify(scannedItems), orderId]);
-    await pool.query('INSERT INTO order_history (order_id, action, user_name, new_value) VALUES ($1, $2, $3, $4)', [orderId, 'barcode_scanned', 'Preparer #' + preparerId, barcode]).catch(() => {});
-    console.log('Barcode scanned:', barcode, 'for order:', orderId);
+    await pool.query('INSERT INTO order_history (order_id, action, user_name, new_value) VALUES ($1, $2, $3, $4)', [orderId, 'barcode_scanned', 'Preparer #' + preparerId, scannedBarcode]).catch(() => {});
+    console.log('Barcode scanned:', scannedBarcode, 'for order:', orderId);
     res.json({ ok: true, matched: true, item: matchedItem, scannedItems });
   } catch (e) {
     console.error('Scan error:', e);
@@ -4535,16 +4600,18 @@ app.get('/api/preparation/orders', async (req, res) => {
     return res.status(400).json({ error: 'preparerId مطلوب ويجب أن يكون رقماً صحيحاً', received: req.query.preparerId });
   }
   try {
-    // SELECT أعمدة معينة بس (ليس *) عشان نتجنب bosta_awb_base64 الضخم
-    // وفلترة أدق: الطلبات اللي محتاجة تحضير فقط (مش completed)، ومش ملغية
+    // الفلترة:
+    // 1. الطلب لسه في المخزن (جديد أو تم التعيين) — مش جاري التوصيل ولا مكتمل
+    // 2. لم يتم تحضيره (preparation_status IS NULL) أو الشخص ده اللي بدأ تحضيره
+    // 3. مش ملغي
     const result = await pool.query(`
       SELECT o.id, o.shopify_id, o.name, o.phone, o.area, o.addr, o.total, o.paid,
              o.items, o.line_items_json, o.scanned_items, o.status, o.created_at,
-             o.preparation_status, o.preparation_started_by, o.preparation_started_at
+             o.preparation_status, o.preparation_started_by, o.preparation_started_at,
+             o.courier_id
       FROM orders o
-      WHERE (o.preparation_status IS NULL OR o.preparation_status = 'in_progress')
-        AND o.status NOT IN ('ملغي', 'مسوّى')
-        AND (o.preparation_started_by IS NULL OR o.preparation_started_by = $1)
+      WHERE o.status IN ('جديد', 'تم التعيين')
+        AND (o.preparation_status IS NULL OR (o.preparation_status = 'in_progress' AND o.preparation_started_by = $1))
       ORDER BY o.created_at DESC
       LIMIT 50
     `, [preparerId]);
@@ -4561,6 +4628,7 @@ app.get('/api/preparation/orders', async (req, res) => {
       items: row.line_items_json || row.items,
       scannedItems: row.scanned_items,
       status: row.status,
+      courierId: row.courier_id,
       preparationStatus: row.preparation_status,
       preparationStartedBy: row.preparation_started_by,
       preparationStartedAt: row.preparation_started_at,
@@ -4570,6 +4638,100 @@ app.get('/api/preparation/orders', async (req, res) => {
   } catch (e) {
     console.error('Get preparation orders error:', e.message, e.stack);
     res.status(500).json({ error: 'فشل تحميل الطلبات: ' + e.message });
+  }
+});
+
+// /api/preparation/find/:id — للـ QR scan: يدور على الطلب أينما كان ويرجع رسالة واضحة
+app.get('/api/preparation/find/:id', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  const orderId = String(req.params.id || '').trim();
+  const preparerId = parseInt(req.query.preparerId, 10);
+  if (!orderId) return res.status(400).json({ error: 'order id required' });
+
+  try {
+    // ابحث بالـ ID المباشر، أو بالـ shopify_id
+    const r = await pool.query(`
+      SELECT o.id, o.status, o.preparation_status, o.preparation_started_by,
+             o.preparation_completed_by, o.preparation_completed_at, o.courier_id,
+             c.name as preparer_name, c2.name as courier_name
+      FROM orders o
+      LEFT JOIN couriers c ON o.preparation_started_by = c.id
+      LEFT JOIN couriers c2 ON o.courier_id = c2.id
+      WHERE o.id = $1 OR o.shopify_id = $1
+      LIMIT 1
+    `, [orderId]);
+
+    if (!r.rows.length) {
+      return res.json({ found: false, canPrepare: false, reason: 'الطلب غير موجود في النظام' });
+    }
+
+    const o = r.rows[0];
+
+    // حالة 1: الطلب اتحضّر خلاص
+    if (o.preparation_status === 'completed') {
+      return res.json({
+        found: true, canPrepare: false, orderId: o.id,
+        reason: `هذا الطلب تم تحضيره${o.preparer_name ? ' بواسطة ' + o.preparer_name : ''}`
+      });
+    }
+
+    // حالة 2: الطلب ملغي
+    if (o.status === 'ملغي') {
+      return res.json({ found: true, canPrepare: false, orderId: o.id, reason: 'هذا الطلب ملغي' });
+    }
+
+    // حالة 3: الطلب خرج للمندوب أو اتسلّم خلاص
+    if (['جاري التوصيل', 'تم التسليم', 'مرتجع', 'تحت التسوية', 'مسوّى'].includes(o.status)) {
+      const c = o.courier_name ? ` (مع المندوب: ${o.courier_name})` : '';
+      return res.json({
+        found: true, canPrepare: false, orderId: o.id,
+        reason: `هذا الطلب خرج من المخزن — حالته: ${o.status}${c}`
+      });
+    }
+
+    // حالة 4: الطلب شغال عليه محضر تاني
+    if (o.preparation_status === 'in_progress' && preparerId && o.preparation_started_by !== preparerId) {
+      return res.json({
+        found: true, canPrepare: false, orderId: o.id,
+        reason: `هذا الطلب قيد التحضير${o.preparer_name ? ' بواسطة ' + o.preparer_name : ' بواسطة شخص آخر'}`
+      });
+    }
+
+    // حالة 5: تمام، الطلب جاهز للتحضير (أو هو اللي بدأ فيه)
+    return res.json({
+      found: true, canPrepare: true, orderId: o.id,
+      status: o.status, preparationStatus: o.preparation_status
+    });
+  } catch (e) {
+    console.error('Find prep order error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// /api/preparation/order/:id/barcodes — يرجع الباركودات المتاحة في الطلب (للـ debug)
+app.get('/api/preparation/order/:id/barcodes', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  try {
+    const r = await pool.query('SELECT id, items, line_items_json FROM orders WHERE id=$1', [req.params.id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Order not found' });
+    let items = [];
+    try { items = JSON.parse(r.rows[0].line_items_json || r.rows[0].items || '[]'); } catch(e) {}
+    if (!Array.isArray(items)) items = [];
+    const result = items.map(i => ({
+      name: i.name,
+      sku: i.sku || '',
+      barcode: i.barcode || null,
+      barcodes: i.barcode ? String(i.barcode).split(',').map(b => b.trim()).filter(b => b) : [],
+      quantity: i.quantity || 1
+    }));
+    res.json({
+      orderId: r.rows[0].id,
+      itemCount: items.length,
+      itemsWithBarcode: result.filter(i => i.barcodes.length > 0).length,
+      items: result
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
