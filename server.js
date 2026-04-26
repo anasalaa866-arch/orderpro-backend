@@ -381,7 +381,7 @@ async function initDB() {
     // ===== v60: امسح invoice cache عشان الفواتير القديمة تتعمل regenerate مع QR code =====
     try {
       const lastVerRes = await pool.query(`SELECT value FROM app_settings WHERE key='last_invoice_template_version'`);
-      const currentTpl = 'inline-images-v3';  // v70: صور inline (base64) من الـ DB
+      const currentTpl = 'compact-a4-v4';  // v71: layout مدمج لطباعة A4 — صفحة واحدة، QR صغير
       if (lastVerRes.rows[0]?.value !== currentTpl) {
         const cleared = await pool.query('DELETE FROM invoice_cache RETURNING order_id');
         await pool.query(
@@ -1740,78 +1740,141 @@ async function generateInvoiceHtml(order, couriersArr) {
     const lineTotal = i.totalPrice || (i.price*qty) || 0;
     const isDiff = lineItems.length > 1 && qty > commonQty;
     const imgHtml = i.image
-      ? `<div style="width:64px;height:64px"><img src="${i.image}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:4px"></div>`
-      : `<div style="width:64px;height:64px;background:#fafbfc;display:flex;align-items:center;justify-content:center;font-size:22px;border-radius:4px">📦</div>`;
+      ? `<div class="item-img"><img src="${i.image}" alt=""></div>`
+      : `<div class="item-img"><span class="item-img-placeholder">📦</span></div>`;
     const qtyHtml = isDiff
-      ? `<div style="min-width:40px;text-align:center;border:2.5px solid #000;border-radius:4px;padding:2px 4px"><div style="font-size:28px;font-weight:900;line-height:1;color:#000">${qty}</div><div style="font-size:8px;font-weight:700;color:#000;margin-top:1px">!!</div></div>`
-      : `<div style="font-size:15px;font-weight:400;width:40px;text-align:left;color:#555">${qty} ×</div>`;
-    const rowStyle = isDiff ? 'border:2px solid #000;border-radius:4px;margin:4px -4px;padding:6px 4px;' : '';
-    return `<div style="display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid #e5e7eb;${rowStyle}">${qtyHtml}${imgHtml}<div style="flex:1"><div style="${isDiff?'font-weight:700;':''}font-size:14px">${(i.name||'').replace(/[<>]/g,'')}</div>${i.variantTitle?`<div style="font-size:11px;color:#6b7280">${i.variantTitle}</div>`:''}${i.sku?`<div style="font-size:11px;color:#6b7280">SKU: ${i.sku}</div>`:''}${i.price>0?`<div style="font-size:11px;color:#6b7280">${fmtMoney(i.price)}</div>`:''}</div><div style="text-align:left;font-weight:700;font-size:14px">${lineTotal>0?fmtMoney(lineTotal):''}</div></div>`;
+      ? `<div class="item-qty" style="border:2px solid #000;border-radius:3px;padding:3px 6px;text-align:center;width:50px"><div style="font-size:20px;font-weight:900;line-height:1">${qty}</div><div style="font-size:8px;font-weight:700;margin-top:1px">!!</div></div>`
+      : `<div class="item-qty">${qty} ×</div>`;
+    const rowStyle = isDiff ? 'background:#fff8e1;' : '';
+    return `<div class="item-row" style="${rowStyle}">${qtyHtml}${imgHtml}<div class="item-info"><div class="item-name"${isDiff?' style="font-weight:800"':''}>${(i.name||'').replace(/[<>]/g,'')}</div>${i.variantTitle?`<div class="item-meta">${i.variantTitle}</div>`:''}${i.sku?`<div class="item-meta">SKU: ${i.sku}</div>`:''}${i.price>0?`<div class="item-meta">${fmtMoney(i.price)}</div>`:''}</div><div class="item-total">${lineTotal>0?fmtMoney(lineTotal):''}</div></div>`;
   }).join('');
 
   return `<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><title>Order ${orderNum}</title>
 <style>
-  body{font-size:15px;margin:0;padding:0;font-family:"Noto Sans",Arial,sans-serif;font-weight:400}
-  *{box-sizing:border-box}
-  .wrapper{width:831px;margin:auto;padding:3em}
-  .header{display:flex;justify-content:space-between;align-items:start;margin-bottom:20px}
-  .brand{font-size:28px;font-weight:800}
-  .order-info{text-align:left;font-size:13px;display:flex;align-items:center;gap:14px}
-  .order-info .code{font-weight:700}
-  .order-qr{width:78px;height:78px;flex-shrink:0}
-  .order-qr svg{width:100%;height:100%;display:block}
-  .ship-to{margin-bottom:20px}
-  .ship-label{font-size:11px;font-weight:700;text-transform:uppercase;margin-bottom:6px}
-  .summary-box{margin:1.2em 0.7em 0;border:1.5px solid #000;border-radius:4px;padding:10px 14px;font-size:11px;page-break-inside:avoid;break-inside:avoid}
-  .footer-thanks{text-align:center;margin-top:30px;font-size:12px;color:#555}
-  .print-btn{display:inline-block;background:#000;color:#fff;border:none;padding:10px 24px;border-radius:6px;font-size:14px;cursor:pointer;margin-top:10px}
-  @media print { .no-print{display:none!important} @page{margin:1cm} }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{font-family:"Noto Sans",Arial,sans-serif;font-size:13px;color:#000;background:#fff}
+  .wrapper{max-width:780px;margin:0 auto;padding:24px}
+
+  /* Header — اسم البراند + رقم الطلب + QR صغير */
+  .header{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;border-bottom:2px solid #000;padding-bottom:12px;margin-bottom:14px}
+  .header-left{flex:1}
+  .brand{font-size:24px;font-weight:800;letter-spacing:0.5px}
+  .order-meta{font-size:12px;color:#444;margin-top:2px;line-height:1.5}
+  .order-num{font-weight:700;color:#000;font-size:14px}
+  .header-right{display:flex;align-items:center;gap:10px;flex-shrink:0}
+  .qr-box{width:70px;height:70px;flex-shrink:0;border:1px solid #ccc;padding:2px;background:#fff}
+  .qr-box img{width:100%;height:100%;display:block}
+  .order-id-display{font-size:11px;font-weight:700;text-align:center;line-height:1.3}
+
+  /* Ship to */
+  .ship-to{margin-bottom:14px;padding:8px 0}
+  .ship-label{font-size:10px;font-weight:700;text-transform:uppercase;color:#666;margin-bottom:4px;letter-spacing:0.5px}
+  .ship-name{font-size:15px;font-weight:700;margin-bottom:3px}
+  .ship-addr{font-size:12px;line-height:1.5;color:#222}
+  .ship-phone{direction:ltr;unicode-bidi:plaintext;font-weight:600;font-size:13px;margin-top:3px}
+
+  /* Items */
+  .items-header{display:flex;font-size:10px;font-weight:700;text-transform:uppercase;color:#666;letter-spacing:0.5px;padding:6px 0;border-bottom:1px solid #ccc;margin-bottom:4px}
+  .items-header .h-qty{width:60px}
+  .items-header .h-items{flex:1;padding:0 8px}
+  .items-header .h-total{width:90px;text-align:right}
+
+  .item-row{display:flex;align-items:center;padding:8px 0;border-bottom:1px solid #eee;page-break-inside:avoid;break-inside:avoid}
+  .item-qty{width:60px;font-size:13px;font-weight:600}
+  .item-img{width:50px;height:50px;flex-shrink:0;margin-right:8px;background:#f5f5f5;border:1px solid #e5e5e5;display:flex;align-items:center;justify-content:center;overflow:hidden}
+  .item-img img{width:100%;height:100%;object-fit:cover;display:block}
+  .item-img-placeholder{font-size:18px;color:#bbb}
+  .item-info{flex:1;min-width:0;padding:0 4px}
+  .item-name{font-size:12.5px;font-weight:600;line-height:1.3}
+  .item-meta{font-size:10px;color:#666;margin-top:2px;line-height:1.3}
+  .item-total{width:90px;text-align:right;font-weight:700;font-size:13px}
+
+  /* Totals */
+  .totals{margin-top:12px;padding:10px 0;border-top:2px solid #000;display:flex;justify-content:space-between;font-size:14px;font-weight:700;page-break-inside:avoid}
+  .totals-row{display:flex;justify-content:space-between;padding:3px 0;font-size:13px;font-weight:500}
+  .totals-row.grand{font-size:16px;font-weight:800;border-top:1px solid #000;margin-top:4px;padding-top:6px}
+  .totals-block{width:280px;margin-left:auto}
+
+  /* Summary box (delivery, source, etc) */
+  .summary-box{margin-top:12px;border:1px solid #000;border-radius:4px;padding:10px 14px;display:flex;flex-wrap:wrap;gap:10px 24px;page-break-inside:avoid}
+  .summary-cell{min-width:80px}
+  .summary-label{text-transform:uppercase;font-size:9px;font-weight:700;letter-spacing:0.5px;color:#555;margin-bottom:2px}
+  .summary-value{font-size:13px;font-weight:700}
+  .summary-cell.highlight{border-right:2px solid #000;padding-right:14px}
+  .summary-cell.highlight .summary-value{font-size:18px}
+
+  /* Footer */
+  .footer{text-align:center;margin-top:18px;padding-top:10px;border-top:1px solid #ccc;font-size:11px;color:#555}
+  .footer h3{font-size:14px;color:#000;margin-bottom:4px}
+
+  .no-print-btn{display:inline-block;background:#000;color:#fff;border:none;padding:8px 20px;border-radius:4px;font-size:13px;cursor:pointer;margin-top:8px;font-family:inherit}
+
+  /* CRITICAL: Print rules */
+  @page{size:A4;margin:10mm}
+  @media print{
+    .no-print{display:none!important}
+    .wrapper{max-width:none;padding:0;margin:0}
+    body{font-size:12px}
+    /* امنع تكسير الـ items عبر صفحات */
+    .item-row,.summary-box,.totals,.footer{page-break-inside:avoid;break-inside:avoid}
+  }
 </style></head>
 <body>
 <div class="wrapper">
   <div class="header">
-    <div class="brand">CAFELAX</div>
-    <div class="order-info">
-      <div>
-        <div class="code">Order ${orderNum}</div>
+    <div class="header-left">
+      <div class="brand">CAFELAX</div>
+      <div class="order-meta">
+        <div class="order-num">Order ${orderNum}</div>
         <div>${orderDate}</div>
-        ${order.batch_code || order.batchCode ? `<div style="font-size:10px;color:#6b7280;margin-top:2px">${order.batch_code || order.batchCode}</div>`:''}
+        ${order.batch_code || order.batchCode ? `<div style="font-size:10px;color:#888">${order.batch_code || order.batchCode}</div>`:''}
       </div>
-      <div class="order-qr">
-        <img src="https://quickchart.io/qr?text=${encodeURIComponent(order.id || '')}&size=156&margin=1&ecLevel=M" alt="QR" style="width:100%;height:100%;display:block" onerror="this.style.display='none'">
+    </div>
+    <div class="header-right">
+      <div class="order-id-display">
+        <div style="font-size:9px;color:#888;text-transform:uppercase;letter-spacing:0.5px">Order ID</div>
+        <div style="font-size:14px;font-weight:800">#${orderNum}</div>
+      </div>
+      <div class="qr-box">
+        <img src="https://quickchart.io/qr?text=${encodeURIComponent(order.id || '')}&size=140&margin=0&ecLevel=M" alt="QR" onerror="this.style.display='none'">
       </div>
     </div>
   </div>
+
   <div class="ship-to">
     <div class="ship-label">Ship to</div>
-    <div style="font-size:14px;line-height:1.8"><strong>${(order.name||'').replace(/[<>]/g,'')}</strong><br>${addr1}<br>Egypt<br><span style="direction:ltr;unicode-bidi:plaintext">${order.phone||''}</span></div>
+    <div class="ship-name">${(order.name||'').replace(/[<>]/g,'')}</div>
+    <div class="ship-addr">${addr1}<br>Egypt</div>
+    <div class="ship-phone">${order.phone||''}</div>
   </div>
-  <hr>
-  <div style="display:flex;justify-content:space-between;font-size:11px;font-weight:700;text-transform:uppercase;padding-bottom:8px;border-bottom:1px solid #e5e7eb;margin-bottom:8px">
-    <div style="width:100px">Quantity</div>
-    <div style="flex:1;margin-left:60px">Items</div>
-    <div style="text-align:left">Total</div>
+
+  <div class="items-header">
+    <div class="h-qty">QTY</div>
+    <div class="h-items">ITEMS</div>
+    <div class="h-total">TOTAL</div>
   </div>
   ${itemsHtml}
-  <div style="text-align:left;margin-top:15px;font-size:14px;font-weight:700;line-height:2">
-    Subtotal ${fmtMoney(subtotal)}<br>
-    Shipping ${fmtMoney(shippingCost)}<br>
-    Total ${fmtMoney(total)}
-  </div>
-  <hr>
-  <div class="summary-box">
-    <div style="display:flex;flex-wrap:wrap;gap:10px 28px;align-items:flex-start">
-      <div style="min-width:80px"><div style="text-transform:uppercase;font-size:9px;font-weight:700;letter-spacing:.06em;color:#555;margin-bottom:3px">Delivery</div><strong style="font-size:14px">${deliveryLabel}</strong></div>
-      <div style="min-width:80px"><div style="text-transform:uppercase;font-size:9px;font-weight:700;letter-spacing:.06em;color:#555;margin-bottom:3px">Source</div><strong style="font-size:14px">${sourceLabel}</strong></div>
-      <div style="min-width:80px"><div style="text-transform:uppercase;font-size:9px;font-weight:700;letter-spacing:.06em;color:#555;margin-bottom:3px">Unique Items</div><strong style="font-size:14px">${uniqueItems} items</strong></div>
-      <div style="border-right:2.5px solid #000;padding-right:16px"><div style="text-transform:uppercase;font-size:9px;font-weight:700;letter-spacing:.06em;color:#555;margin-bottom:3px">Total Pieces</div><strong style="font-size:22px">${totalItems} pcs</strong></div>
+
+  <div class="totals">
+    <div class="totals-block">
+      <div class="totals-row"><span>Subtotal</span><span>${fmtMoney(subtotal)}</span></div>
+      <div class="totals-row"><span>Shipping</span><span>${fmtMoney(shippingCost)}</span></div>
+      <div class="totals-row grand"><span>Total</span><span>${fmtMoney(total)}</span></div>
     </div>
   </div>
-  <div class="footer-thanks">
-    <h2 style="margin:10px 0">Thank you for shopping with us!</h2>
-    <p style="margin:4px 0"><strong>CAFELAX</strong><br>info@cafelax.com<br>www.cafelax.com</p>
-    <button class="print-btn no-print" onclick="window.print()">Print / Save PDF</button>
+
+  <div class="summary-box">
+    <div class="summary-cell"><div class="summary-label">Delivery</div><div class="summary-value">${deliveryLabel}</div></div>
+    <div class="summary-cell"><div class="summary-label">Source</div><div class="summary-value">${sourceLabel}</div></div>
+    <div class="summary-cell"><div class="summary-label">Items</div><div class="summary-value">${uniqueItems}</div></div>
+    <div class="summary-cell highlight"><div class="summary-label">Total Pieces</div><div class="summary-value">${totalItems} pcs</div></div>
+  </div>
+
+  <div class="footer">
+    <h3>Thank you for shopping with us!</h3>
+    <div><strong>CAFELAX</strong> · info@cafelax.com · www.cafelax.com</div>
+    <button class="no-print-btn no-print" onclick="window.print()">🖨️ Print</button>
   </div>
 </div>
 </body></html>`;
@@ -2443,7 +2506,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v70-2026-04-26-inline-images';
+const SERVER_VERSION = 'v71-2026-04-26-compact-a4';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
