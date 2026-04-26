@@ -826,7 +826,16 @@ app.patch('/api/orders/:id', async (req, res) => {
   const oldRow = oldRows[0] || {};
 
   Object.entries(b).forEach(([k, v]) => {
-    if (map[k]) { sets.push(`${map[k]}=$${vals.length+1}`); vals.push(v); }
+    if (map[k]) {
+      // 🆕 v83: defensive — لو courierId='bosta' أو string غير رقمي, حوله لـ null
+      if (k === 'courierId' && v != null && (v === 'bosta' || (typeof v === 'string' && isNaN(parseInt(v))))) {
+        sets.push(`${map[k]}=$${vals.length+1}`);
+        vals.push(null);
+      } else {
+        sets.push(`${map[k]}=$${vals.length+1}`);
+        vals.push(v);
+      }
+    }
   });
   if (!sets.length) return res.status(400).json({ error: 'No fields to update' });
   sets.push(`updated_at=NOW()`);
@@ -2756,7 +2765,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v82-2026-04-26-bosta-parcels';
+const SERVER_VERSION = 'v83-2026-04-26-bosta-defensive';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -4721,10 +4730,10 @@ app.post('/api/field-cancellations/:orderId/revert', async (req, res) => {
 // Server startup
 if (DB_ENABLED) {
   initDB().then(() => {
-    app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT));
+    app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT, '| version:', SERVER_VERSION));
   });
 } else {
-  app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT, '(بدون DB)'));
+  app.listen(PORT, () => console.log('🚀 OrderPro Backend شغال على port', PORT, '| version:', SERVER_VERSION, '(بدون DB)'));
 }
 
 // ===== TREASURY =====
