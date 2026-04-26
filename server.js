@@ -2616,7 +2616,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v77-2026-04-26-images-fix';
+const SERVER_VERSION = 'v77b-2026-04-26-test-enrich';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -5191,6 +5191,89 @@ app.post('/api/admin/backfill-images', async (req, res) => {
   } catch (e) {
     console.error('backfill-images:', e);
     res.status(500).json({ error: e.message });
+  }
+});
+
+// 🆕 v77b: GET /api/admin/test-image-enrich/:orderId
+// اختبار enrichment على طلب واحد مع logs مفصلة
+app.get('/api/admin/test-image-enrich/:orderId', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  const orderId = req.params.orderId;
+  const logs = [];
+  const log = (msg) => { logs.push(msg); console.log('[test-enrich]', msg); };
+
+  try {
+    // 1) جيب الطلب من الـ DB
+    const r = await pool.query('SELECT id, shopify_id FROM orders WHERE id=$1', [orderId]);
+    if (!r.rows.length) return res.json({ ok: false, error: 'Order not found', logs });
+    const row = r.rows[0];
+    log(`✅ Found order ${orderId}, shopify_id=${row.shopify_id}`);
+
+    if (!row.shopify_id) return res.json({ ok: false, error: 'Not a Shopify order', logs });
+
+    // 2) جيب الـ credentials
+    const creds = await getShopifyCredentials();
+    if (!creds.shopUrl || !creds.accessToken) {
+      return res.json({ ok: false, error: 'Shopify credentials not configured', logs });
+    }
+    const host = creds.shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+    log(`✅ Shopify host: ${host}`);
+
+    // 3) جيب line_items من Shopify
+    const sh = await shopifyRequest(host, creds.accessToken,
+      `/admin/api/2024-10/orders/${row.shopify_id}.json?fields=line_items`);
+    log(`✅ Shopify response status: ${sh.status}`);
+    if (sh.status !== 200 || !sh.data.order) {
+      return res.json({ ok: false, error: 'Shopify fetch failed', status: sh.status, logs });
+    }
+    const lineItems = sh.data.order.line_items || [];
+    log(`✅ Got ${lineItems.length} line items from Shopify`);
+
+    // 4) شوف الصور الأصلية
+    const originalImages = lineItems.map(i => ({
+      name: i.name?.slice(0, 30),
+      directImage: i.image?.src || null,
+      productId: i.product_id,
+      variantId: i.variant_id,
+    }));
+    log(`📸 Original images: ${JSON.stringify(originalImages, null, 2)}`);
+
+    // 5) جرب الـ enrichment الجديد
+    log(`🔄 Starting enrichment...`);
+    const startTime = Date.now();
+    const enriched = await enrichLineItemsWithImages(lineItems, host, creds.accessToken);
+    const enrichTime = Date.now() - startTime;
+    log(`✅ Enrichment completed in ${enrichTime}ms`);
+
+    // 6) شوف نتايج الصور
+    const imageResults = enriched.map(i => ({
+      name: i.name?.slice(0, 30),
+      hasImageUrl: !!i.image,
+      imageUrl: i.image,
+      hasBase64: !!i.imageBase64,
+      base64Size: i.imageBase64 ? Math.round(i.imageBase64.length / 1024) + 'KB' : null,
+      base64Preview: i.imageBase64 ? i.imageBase64.slice(0, 50) + '...' : null,
+    }));
+    log(`🖼️ Enrichment results: ${JSON.stringify(imageResults, null, 2)}`);
+
+    const successCount = enriched.filter(i => i.imageBase64).length;
+    const totalWithUrl = enriched.filter(i => i.image).length;
+
+    res.json({
+      ok: true,
+      orderId,
+      itemCount: enriched.length,
+      itemsWithImageUrl: totalWithUrl,
+      itemsWithBase64: successCount,
+      successRate: totalWithUrl > 0 ? Math.round((successCount / totalWithUrl) * 100) + '%' : 'N/A',
+      enrichTimeMs: enrichTime,
+      saved: false, // dry run بس
+      logs,
+      sampleResults: imageResults,
+    });
+  } catch (e) {
+    log(`❌ EXCEPTION: ${e.message}`);
+    res.status(500).json({ ok: false, error: e.message, stack: e.stack, logs });
   }
 });
 
