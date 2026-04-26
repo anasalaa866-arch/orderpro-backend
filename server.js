@@ -1236,33 +1236,37 @@ app.post('/api/bosta/create', async (req, res) => {
 
   const payload = {
     type: 10,
+    // 🆕 v85: Bosta SDK الرسمي بيستخدم اسم "specs" — جربنا و ما اشتغلش
+    // المرة دي نبعت بـ deliverySpecs مع الـ structure الصحيحة
     specs: {
       packageDetails: {
-        numberOfParcels: totalParcels,  // ⭐ عدد القطع الفعلي
-        description: packageDescription,  // ⭐ وصف الشحنة = المنتجات
-        // 🆕 v82: قيمة المنتج في كل الـ fields المحتملة في packageDetails
-        value: orderTotal,
-        orderValue: orderTotal,
-        cashOnDelivery: codAmount,
-        items: parcelItems,
+        numberOfParcels: totalParcels,
+        description: packageDescription,
+        // 🆕 v85: documentValue هو اسم القيمة عند بوسطة في بعض الإصدارات
+        documentValue: orderTotal,
       },
       packageType: 'Parcel',
-      size: 'SMALL',  // 🆕 v82: الحجم الافتراضي
+      size: 'SMALL',
     },
+    // الـ COD = مبلغ التحصيل (بيظهر تحت "مبلغ التحصيل" في البوليصة)
     cod: codAmount,
-    // 🆕 v81: نحط قيمة المنتج في كل الحقول المحتملة عشان نضمن إن بوسطة هتقبلها
-    orderValue: orderTotal,
+    // 🆕 v85: cashOnDelivery منفصلة عن orderValue حسب SDK
     cashOnDelivery: codAmount,
+    // 🆕 v85: قيمة المنتج / الطرد — بنحطها في الفيلد الموحدة
+    // amount عادة بيشير لـ value في الـ legacy API
+    amount: orderTotal,
+    orderValue: orderTotal,
     packageValue: orderTotal,
     productValue: orderTotal,
+    declaredValue: orderTotal,
+    items: parcelItems,  // الـ items بشكل منفصل في الـ root
     dropOffAddress: { city: order.area || 'القاهرة', firstLine: order.addr || order.area || '—' },
     receiver: {
       firstName: nameParts[0] || 'عميل',
       lastName: nameParts.slice(1).join(' ') || '.',
       phone: (order.phone || '01000000000').replace(/[^0-9+]/g, ''),
     },
-    businessReference: businessRef,  // ⭐ بدون SH-
-    // 🆕 v79: ملاحظة ثابتة
+    businessReference: businessRef,
     notes: 'في حالة حدوث اي مشكلة برجاء الاتصال علي 01080008022',
   };
 
@@ -2796,7 +2800,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v84-2026-04-26-bosta-debug';
+const SERVER_VERSION = 'v85-2026-04-26-bosta-value';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
