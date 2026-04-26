@@ -381,7 +381,7 @@ async function initDB() {
     // ===== v60: امسح invoice cache عشان الفواتير القديمة تتعمل regenerate مع QR code =====
     try {
       const lastVerRes = await pool.query(`SELECT value FROM app_settings WHERE key='last_invoice_template_version'`);
-      const currentTpl = 'qr-v2-server-img';  // server-side QR via quickchart.io
+      const currentTpl = 'inline-images-v3';  // v70: صور inline (base64) من الـ DB
       if (lastVerRes.rows[0]?.value !== currentTpl) {
         const cleared = await pool.query('DELETE FROM invoice_cache RETURNING order_id');
         await pool.query(
@@ -1640,14 +1640,15 @@ function fetchImageAsBase64(imageUrl) {
 }
 
 async function generateInvoiceHtml(order, couriersArr) {
-  // جيب line items مع الصور (مرّة واحدة) وحوّلهم لـ base64
+  // جيب line items من الـ DB (المفروض الصور بقت مدمجة كـ base64 من webhook)
   let lineItems = [];
   try { lineItems = JSON.parse(order.line_items_json || order.lineItemsJson || '[]'); } catch(e) {}
 
-  // للطلبات Shopify: تأكد إن الصور موجودة، وإن لم تكن - جيبها
+  // 🆕 v70: لو الطلب من Shopify ومفيهوش imageBase64 (طلب قديم)، عمل enrich فوري ومحفّظ
+  // ده بيحصل مرة واحدة بس لكل طلب — مرة جاية الفاتورة هتطبع فوراً
   if (order.src === 'shopify' && (order.shopify_id || order.shopifyId)) {
-    const hasAllImages = lineItems.length > 0 && lineItems.every(i => i.image);
-    if (!hasAllImages) {
+    const needsEnrich = !lineItems.length || lineItems.some(i => i.image && !i.imageBase64);
+    if (needsEnrich) {
       const creds = await getShopifyCredentials();
       const shopUrl = creds.shopUrl;
       const accessToken = creds.accessToken;
@@ -1658,6 +1659,17 @@ async function generateInvoiceHtml(order, couriersArr) {
             `/admin/api/2024-10/orders/${order.shopify_id || order.shopifyId}.json?fields=line_items`);
           if (r.status === 200 && r.data.order) {
             lineItems = await enrichLineItemsWithImages(r.data.order.line_items || [], host, accessToken);
+            // 💾 احفظ في الـ DB عشان المرة الجاية تكون فوراً
+            const orderId = order.id;
+            if (DB_ENABLED && orderId) {
+              try {
+                await pool.query(
+                  'UPDATE orders SET line_items_json=$1, updated_at=NOW() WHERE id=$2',
+                  [JSON.stringify(lineItems), orderId]
+                );
+                console.log('💾 Auto-enriched & saved images for invoice:', orderId);
+              } catch(saveErr) { console.warn('save enriched failed:', saveErr.message); }
+            }
           }
         } catch(e) { console.warn('fetch images for invoice:', e.message); }
       }
@@ -1675,20 +1687,13 @@ async function generateInvoiceHtml(order, couriersArr) {
   }
   if (!lineItems.length) lineItems = [{name: order.details || '—', quantity: 1, price: order.total || 0, totalPrice: order.total || 0}];
 
-  // حوّل الصور لـ base64 (مع تحديد وقت max 12 ثانية للصورة الواحدة)
-  const imagePromises = lineItems.map(i => {
-    if (!i.image) return Promise.resolve(null);
-    // لو الصورة مش URL صحيح أو بالفعل data:، سيبها زي ما هي
-    if (typeof i.image !== 'string' || !i.image.startsWith('http')) return Promise.resolve(i.image);
-    return fetchImageAsBase64(i.image);
-  });
-  const base64Images = await Promise.all(imagePromises);
-  lineItems.forEach((i, idx) => {
-    if (base64Images[idx]) {
-      i.image = base64Images[idx];
+  // ⚡ سرعة فائقة: نستخدم imageBase64 مباشرة، مفيش network calls
+  // لو لسه مفيش imageBase64 (للـ backward compatibility)، نستخدم الـ URL
+  lineItems.forEach(i => {
+    if (i.imageBase64) {
+      i.image = i.imageBase64;  // الصورة inline (instant rendering)
     }
-    // لو الـ fetch فشل، نحتفظ بـ i.image الأصلي (URL) بدل ما نخليها null
-    // عشان المتصفح يحاول يحمل الصورة وقت الطباعة
+    // وإلا i.image يفضل URL — المتصفح يحاول يحمله
   });
 
   // بيانات العنوان بدون تكرار
@@ -2175,7 +2180,35 @@ async function enrichLineItemsWithImages(lineItems, host, accessToken) {
     } catch(e) { console.warn('enrich product:', pid, e.message); }
   }
 
-  return lineItems.map(i => {
+  // helper: حمّل صورة وحوّلها لـ base64 (مع cache بالـ URL عشان لا نحمل نفس الصورة مرتين)
+  const imageBase64Cache = {};
+  async function downloadAsBase64(url) {
+    if (!url) return null;
+    if (imageBase64Cache[url] !== undefined) return imageBase64Cache[url];
+    try {
+      // استخدم Shopify CDN مع size param للتقليل من الحجم
+      // مثال: ../products/coffee.jpg → ../products/coffee_200x200.jpg (~10-20KB بدل 200KB)
+      const sizedUrl = url.replace(/(\.(jpg|jpeg|png|webp))(\?.*)?$/i, '_300x300$1$3');
+      const data = await fetchBinary(sizedUrl);
+      if (!data) {
+        imageBase64Cache[url] = null;
+        return null;
+      }
+      const ext = (sizedUrl.match(/\.(jpg|jpeg|png|webp)/i) || ['','jpeg'])[1].toLowerCase();
+      const mime = ext === 'jpg' ? 'jpeg' : ext;
+      const b64 = `data:image/${mime};base64,` + data.toString('base64');
+      imageBase64Cache[url] = b64;
+      return b64;
+    } catch(e) {
+      console.warn('downloadAsBase64 failed:', url, e.message);
+      imageBase64Cache[url] = null;
+      return null;
+    }
+  }
+
+  // اعمل enrich مع تحميل الصور كـ base64 (parallel لكن مع limit عشان نتجنب rate limit)
+  const enriched = [];
+  for (const i of lineItems) {
     let imageUrl = (i.image && i.image.src) ? i.image.src : null;
     if (!imageUrl && i.variant_id && variantImageCache[i.variant_id]) imageUrl = variantImageCache[i.variant_id];
     if (!imageUrl && i.product_id && productImageCache[i.product_id]) imageUrl = productImageCache[i.product_id];
@@ -2186,7 +2219,10 @@ async function enrichLineItemsWithImages(lineItems, host, accessToken) {
       barcode = variantBarcodeCache[i.variant_id];
     }
 
-    return {
+    // حمّل الصورة كـ base64 لو فيها URL
+    const imageBase64 = imageUrl ? await downloadAsBase64(imageUrl) : null;
+
+    enriched.push({
       name: i.name,
       title: i.title,
       variantTitle: i.variant_title || '',
@@ -2195,10 +2231,42 @@ async function enrichLineItemsWithImages(lineItems, host, accessToken) {
       quantity: i.quantity,
       price: parseFloat(i.price) || 0,
       totalPrice: (parseFloat(i.price) || 0) * (i.quantity || 1),
-      image: imageUrl,
+      image: imageUrl,           // الـ URL الأصلي (للـ backwards compat)
+      imageBase64: imageBase64,  // ⭐ الصورة inline كـ base64 (للـ instant printing)
       productId: i.product_id,
       variantId: i.variant_id,
-    };
+    });
+  }
+
+  return enriched;
+}
+
+// Helper: تحميل صورة (أو أي binary) من URL
+function fetchBinary(url, timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(url);
+      const lib = u.protocol === 'https:' ? require('https') : require('http');
+      const req = lib.get(url, { timeout: timeoutMs }, (res) => {
+        // اتبع redirects
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          fetchBinary(res.headers.location, timeoutMs).then(resolve);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          resolve(null);
+          return;
+        }
+        const chunks = [];
+        res.on('data', c => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', () => resolve(null));
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+    } catch(e) {
+      resolve(null);
+    }
   });
 }
 
@@ -2375,7 +2443,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v69-2026-04-25-fix-cols';
+const SERVER_VERSION = 'v70-2026-04-26-inline-images';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -4804,6 +4872,109 @@ app.get('/api/preparation/order/:id/barcodes', async (req, res) => {
       itemCount: items.length,
       itemsWithBarcode: result.filter(i => i.barcodes.length > 0).length,
       items: result
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 🆕 v70: Backfill endpoint — يحمل صور للطلبات اللي معندهاش imageBase64
+// POST /api/admin/backfill-images
+// body: { limit: 50, dryRun: false } — يشغّل على دفعات
+app.post('/api/admin/backfill-images', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  const limit = Math.min(parseInt(req.body.limit) || 20, 50);
+  const dryRun = req.body.dryRun === true;
+  try {
+    // جيب الطلبات الـ Shopify اللي ما عندهاش imageBase64
+    const r = await pool.query(
+      `SELECT id, shopify_id, line_items_json, src
+       FROM orders
+       WHERE src='shopify' AND shopify_id IS NOT NULL
+         AND created_at >= NOW() - INTERVAL '30 days'
+         AND (
+           line_items_json IS NULL
+           OR line_items_json = ''
+           OR line_items_json NOT LIKE '%imageBase64%'
+         )
+       ORDER BY created_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+
+    if (!r.rows.length) {
+      return res.json({ processed: 0, message: 'كل الطلبات عندها صور بالفعل' });
+    }
+
+    if (dryRun) {
+      return res.json({
+        wouldProcess: r.rows.length,
+        sampleIds: r.rows.slice(0, 5).map(x => x.id)
+      });
+    }
+
+    const creds = await getShopifyCredentials();
+    if (!creds.shopUrl || !creds.accessToken) {
+      return res.status(400).json({ error: 'Shopify credentials not configured' });
+    }
+    const host = creds.shopUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+
+    let success = 0;
+    let failed = 0;
+    const errors = [];
+
+    for (const row of r.rows) {
+      try {
+        const sh = await shopifyRequest(host, creds.accessToken,
+          `/admin/api/2024-10/orders/${row.shopify_id}.json?fields=line_items`);
+        if (sh.status !== 200 || !sh.data.order) {
+          failed++;
+          errors.push({ id: row.id, error: 'Shopify ' + sh.status });
+          continue;
+        }
+        const enriched = await enrichLineItemsWithImages(sh.data.order.line_items || [], host, creds.accessToken);
+        await pool.query(
+          'UPDATE orders SET line_items_json=$1, updated_at=NOW() WHERE id=$2',
+          [JSON.stringify(enriched), row.id]
+        );
+        // امسح الـ invoice cache عشان يتعمل regenerate بالصور الجديدة
+        await pool.query('DELETE FROM invoice_cache WHERE order_id=$1', [row.id]).catch(()=>{});
+        success++;
+      } catch (e) {
+        failed++;
+        errors.push({ id: row.id, error: e.message });
+      }
+    }
+
+    res.json({
+      processed: r.rows.length,
+      success,
+      failed,
+      errors: errors.slice(0, 10),
+      hasMore: r.rows.length === limit
+    });
+  } catch (e) {
+    console.error('backfill-images:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/admin/backfill-images/status — كم طلب لسه محتاج enrich
+app.get('/api/admin/backfill-images/status', async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  try {
+    const r = await pool.query(
+      `SELECT
+        COUNT(*) FILTER (WHERE line_items_json LIKE '%imageBase64%') as with_images,
+        COUNT(*) FILTER (WHERE line_items_json IS NOT NULL AND line_items_json NOT LIKE '%imageBase64%') as without_images,
+        COUNT(*) FILTER (WHERE line_items_json IS NULL OR line_items_json = '') as no_data
+       FROM orders
+       WHERE src='shopify' AND created_at >= NOW() - INTERVAL '30 days'`
+    );
+    res.json({
+      withImages: parseInt(r.rows[0].with_images) || 0,
+      withoutImages: parseInt(r.rows[0].without_images) || 0,
+      noData: parseInt(r.rows[0].no_data) || 0,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
