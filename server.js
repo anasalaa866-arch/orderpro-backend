@@ -1232,15 +1232,27 @@ app.post('/api/bosta/create', async (req, res) => {
       const deliveryId = d._id || d.id;
       const trackingNumber = d.trackingNumber || d._id;
 
-      // جلب الـ AWB تلقائياً بعد الإنشاء
+      // 🆕 v80: جلب الـ AWB مع retry — Bosta أحياناً بتاخد ثواني لتجهيز الـ PDF
       let awbBase64 = null, awbUrl = null;
-      try {
-        const awbR = await bostaRequest(env, apiKey, '/deliveries/'+deliveryId+'/airwaybill', 'GET', null, true);
-        if (awbR.status === 200 && awbR.buffer) {
-          awbBase64 = awbR.buffer.toString('base64');
-          awbUrl = 'data:application/pdf;base64,' + awbBase64;
-        }
-      } catch (awbErr) { console.log('AWB fetch failed:', awbErr.message); }
+      const awbAttempts = [
+        { delay: 0, label: 'فوري' },
+        { delay: 2000, label: 'بعد 2 ثانية' },
+        { delay: 4000, label: 'بعد 4 ثواني' },
+      ];
+      for (const attempt of awbAttempts) {
+        if (attempt.delay) await new Promise(r => setTimeout(r, attempt.delay));
+        try {
+          const awbR = await bostaRequest(env, apiKey, '/deliveries/'+deliveryId+'/airwaybill', 'GET', null, true);
+          if (awbR.status === 200 && awbR.buffer && awbR.buffer.length > 1000) {
+            awbBase64 = awbR.buffer.toString('base64');
+            awbUrl = 'data:application/pdf;base64,' + awbBase64;
+            console.log(`✅ AWB fetched (${attempt.label}) for ${order.id}, size: ${Math.round(awbR.buffer.length/1024)}KB`);
+            break;
+          } else {
+            console.log(`⏳ AWB not ready yet (${attempt.label}), status=${awbR.status}, size=${awbR.buffer?.length || 0}`);
+          }
+        } catch (awbErr) { console.log(`AWB attempt ${attempt.label} failed:`, awbErr.message); }
+      }
 
       // حفظ في قاعدة البيانات أو الذاكرة
       if (order.id) {
@@ -1254,6 +1266,29 @@ app.post('/api/bosta/create', async (req, res) => {
           const o = memOrders.find(x=>x.id===order.id);
           if (o) { o.bostaId=deliveryId; o.bostaTrackingNo=trackingNumber; o.bostaAwbBase64=awbBase64; }
         }
+      }
+
+      // 🆕 v80: لو الـ AWB ما اتجابش، عيد المحاولة في الخلفية (مش بنوقف الـ user)
+      if (!awbBase64 && order.id && DB_ENABLED) {
+        setImmediate(async () => {
+          for (const delay of [10000, 30000, 60000]) {  // بعد 10s, 30s, 60s
+            await new Promise(r => setTimeout(r, delay));
+            try {
+              const awbR = await bostaRequest(env, apiKey, '/deliveries/'+deliveryId+'/airwaybill', 'GET', null, true);
+              if (awbR.status === 200 && awbR.buffer && awbR.buffer.length > 1000) {
+                const b64 = awbR.buffer.toString('base64');
+                const url = 'data:application/pdf;base64,' + b64;
+                await pool.query(
+                  'UPDATE orders SET bosta_awb_url=$1, bosta_awb_base64=$2, updated_at=NOW() WHERE id=$3',
+                  [url, b64, order.id]
+                );
+                console.log(`✅ Background AWB fetch succeeded for ${order.id} (after ${delay/1000}s)`);
+                return;
+              }
+            } catch (e) { /* استمر للمحاولة الجاية */ }
+          }
+          console.warn(`⚠️ Background AWB fetch gave up for ${order.id}`);
+        });
       }
 
       res.json({ success: true, deliveryId, trackingNumber, hasAwb: !!awbBase64 });
@@ -2653,7 +2688,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v79-2026-04-26-bosta-awb';
+const SERVER_VERSION = 'v80-2026-04-26-awb-retry';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
