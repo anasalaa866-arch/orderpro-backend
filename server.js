@@ -1176,6 +1176,23 @@ app.post('/api/bosta/create', async (req, res) => {
   // قص الوصف لو طويل (Bosta عندها limit ~250 char)
   if (packageDescription.length > 240) packageDescription = packageDescription.slice(0, 237) + '...';
 
+  // 🆕 v82: حساب عدد القطع الفعلي من الـ line items (مجموع الـ quantities)
+  let totalParcels = 1;
+  let parcelItems = []; // detailed items list for Bosta
+  try {
+    const lineItems = JSON.parse(order.lineItemsJson || order.line_items_json || '[]');
+    if (lineItems.length) {
+      totalParcels = lineItems.reduce((sum, i) => sum + (parseInt(i.quantity) || 1), 0);
+      parcelItems = lineItems.map(i => ({
+        itemName: (i.name || i.title || 'منتج').slice(0, 100),
+        quantity: parseInt(i.quantity) || 1,
+        cod: 0,
+        itemValue: parseFloat(i.price) || 0,
+      }));
+    }
+  } catch (e) {}
+  if (totalParcels < 1) totalParcels = 1;
+
   // 🆕 v79: رقم مرجع الطلب بدون "SH-"
   const businessRef = String(order.id || '').replace(/^SH-/, '');
 
@@ -1184,21 +1201,30 @@ app.post('/api/bosta/create', async (req, res) => {
   const orderTotal = parseFloat(order.total) || 0;
   const codAmount = order.paid ? 0 : orderTotal;
 
+  // لو مفيش items details، اعمل item واحد بقيمة الطلب
+  if (!parcelItems.length) {
+    parcelItems = [{
+      itemName: packageDescription.slice(0, 100),
+      quantity: totalParcels,
+      cod: 0,
+      itemValue: orderTotal,
+    }];
+  }
+
   const payload = {
     type: 10,
     specs: {
       packageDetails: {
-        numberOfParcels: 1,
+        numberOfParcels: totalParcels,  // ⭐ عدد القطع الفعلي
         description: packageDescription,  // ⭐ وصف الشحنة = المنتجات
-        // 🆕 v81: قيمة المنتج في specs.packageDetails (الـ Bosta SDK Python بتحطها هنا)
-        items: [{
-          itemName: packageDescription.slice(0, 100),
-          quantity: 1,
-          cod: codAmount,  // مبلغ التحصيل
-          itemValue: orderTotal,  // قيمة المنتج
-        }],
+        // 🆕 v82: قيمة المنتج في كل الـ fields المحتملة في packageDetails
+        value: orderTotal,
+        orderValue: orderTotal,
+        cashOnDelivery: codAmount,
+        items: parcelItems,
       },
       packageType: 'Parcel',
+      size: 'SMALL',  // 🆕 v82: الحجم الافتراضي
     },
     cod: codAmount,
     // 🆕 v81: نحط قيمة المنتج في كل الحقول المحتملة عشان نضمن إن بوسطة هتقبلها
@@ -1217,13 +1243,14 @@ app.post('/api/bosta/create', async (req, res) => {
     notes: 'في حالة حدوث اي مشكلة برجاء الاتصال علي 01080008022',
   };
 
-  // 🆕 v81: log الـ payload للتحقق
-  console.log('📦 Bosta payload:', JSON.stringify({
+  // 🆕 v82: log أوضح للـ payload
+  console.log('📦 Bosta payload summary:', JSON.stringify({
+    orderId: order.id,
     cod: payload.cod,
     orderValue: payload.orderValue,
-    packageValue: payload.packageValue,
-    cashOnDelivery: payload.cashOnDelivery,
-    items: payload.specs.packageDetails.items,
+    totalParcels,
+    parcelItemsCount: parcelItems.length,
+    description: packageDescription.slice(0, 50),
   }));
   // pickupAddress مطلوبة دايماً ببوسطة — لازم يكون فيها firstLine
   if (locationId) {
@@ -2729,7 +2756,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v81-2026-04-26-bosta-value-fix';
+const SERVER_VERSION = 'v82-2026-04-26-bosta-parcels';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
