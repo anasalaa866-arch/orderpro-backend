@@ -1156,18 +1156,55 @@ app.post('/api/bosta/create', async (req, res) => {
   const { apiKey, env = 'production', locationId, order } = req.body;
   if (!apiKey || !order) return res.status(400).json({ success: false, error: 'بيانات ناقصة' });
   const nameParts = (order.name || '').trim().split(/\s+/);
+
+  // 🆕 v79: بناء وصف الشحنة من المنتجات (زي شيت تصدير بوسطة)
+  let packageDescription = '';
+  try {
+    const lineItems = JSON.parse(order.lineItemsJson || order.line_items_json || '[]');
+    if (lineItems.length) {
+      packageDescription = lineItems
+        .map(i => `${i.quantity || 1}x ${i.name || i.title || ''}`.trim())
+        .filter(Boolean)
+        .join(' | ');
+    }
+  } catch (e) {}
+  // fallback: استخدم order.items (string) لو مفيش lineItemsJson
+  if (!packageDescription && order.items) {
+    packageDescription = order.items;
+  }
+  if (!packageDescription) packageDescription = 'منتجات';
+  // قص الوصف لو طويل (Bosta عندها limit ~250 char)
+  if (packageDescription.length > 240) packageDescription = packageDescription.slice(0, 237) + '...';
+
+  // 🆕 v79: رقم مرجع الطلب بدون "SH-"
+  const businessRef = String(order.id || '').replace(/^SH-/, '');
+
+  // 🆕 v79: قيمة المنتج (totalCost) دايماً = total الطلب، حتى لو مدفوع
+  // الـ COD = 0 لو مدفوع، أو total لو COD
+  const orderTotal = parseFloat(order.total) || 0;
+  const codAmount = order.paid ? 0 : orderTotal;
+
   const payload = {
     type: 10,
-    specs: { packageDetails: { numberOfParcels: 1 } },
-    cod: order.paid ? 0 : (order.total || 0),
+    specs: {
+      packageDetails: {
+        numberOfParcels: 1,
+        description: packageDescription,  // ⭐ وصف الشحنة = المنتجات
+      },
+      packageType: 'Parcel',
+    },
+    cod: codAmount,
+    // قيمة الشحنة (orderValue / packageValue) — Bosta بتسميه أحياناً orderValue
+    orderValue: orderTotal,  // ⭐ قيمة المنتج = total دايماً
     dropOffAddress: { city: order.area || 'القاهرة', firstLine: order.addr || order.area || '—' },
     receiver: {
       firstName: nameParts[0] || 'عميل',
       lastName: nameParts.slice(1).join(' ') || '.',
       phone: (order.phone || '01000000000').replace(/[^0-9+]/g, ''),
     },
-    businessReference: order.id,
-    notes: order.note || '',
+    businessReference: businessRef,  // ⭐ بدون SH-
+    // 🆕 v79: ملاحظة ثابتة
+    notes: 'في حالة حدوث اي مشكلة برجاء الاتصال علي 01080008022',
   };
   // pickupAddress مطلوبة دايماً ببوسطة — لازم يكون فيها firstLine
   if (locationId) {
@@ -2616,7 +2653,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v78-2026-04-26-images-clean';
+const SERVER_VERSION = 'v79-2026-04-26-bosta-awb';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
