@@ -331,6 +331,8 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS province TEXT",
       // v71: غيّر reviewed_by في pending_reviews إلى TEXT (كان INTEGER لكن الـ frontend بيبعت username string)
       "ALTER TABLE pending_reviews ALTER COLUMN reviewed_by TYPE TEXT USING reviewed_by::TEXT",
+      // v72: نفس الإصلاح لـ courier_adjustments
+      "ALTER TABLE courier_adjustments ALTER COLUMN reviewed_by TYPE TEXT USING reviewed_by::TEXT",
       "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_orders_courier_id ON orders(courier_id)",
       "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
@@ -2508,7 +2510,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v72-2026-04-26-review-fix';
+const SERVER_VERSION = 'v73-2026-04-26-adj-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -3712,26 +3714,50 @@ app.get('/api/courier-adjustments/pending', async (req, res) => {
 app.post('/api/courier-adjustments/:id/approve', async (req, res) => {
   const {reviewedBy} = req.body || {};
   try{
-    await pool.query(
-      `UPDATE courier_adjustments SET status='approved', reviewed_by=$1, reviewed_at=NOW()
-       WHERE id=$2 AND status='pending'`,
-      [reviewedBy || null, req.params.id]
-    );
+    try {
+      await pool.query(
+        `UPDATE courier_adjustments SET status='approved', reviewed_by=$1, reviewed_at=NOW()
+         WHERE id=$2 AND status='pending'`,
+        [reviewedBy || null, req.params.id]
+      );
+    } catch(typeErr) {
+      console.warn('adj reviewed_by type issue, retrying:', typeErr.message);
+      await pool.query(
+        `UPDATE courier_adjustments SET status='approved', reviewed_at=NOW()
+         WHERE id=$1 AND status='pending'`,
+        [req.params.id]
+      );
+    }
     res.json({success: true});
-  }catch(e){ res.status(500).json({error: e.message}); }
+  }catch(e){
+    console.error('approve adjustment error:', e.message);
+    res.status(500).json({error: e.message});
+  }
 });
 
 // POST /api/courier-adjustments/:id/reject
 app.post('/api/courier-adjustments/:id/reject', async (req, res) => {
   const {reviewedBy, reason} = req.body || {};
   try{
-    await pool.query(
-      `UPDATE courier_adjustments SET status='rejected', reviewed_by=$1, reviewed_at=NOW(),
-       rejection_reason=$2 WHERE id=$3 AND status='pending'`,
-      [reviewedBy || null, reason || '', req.params.id]
-    );
+    try {
+      await pool.query(
+        `UPDATE courier_adjustments SET status='rejected', reviewed_by=$1, reviewed_at=NOW(),
+         rejection_reason=$2 WHERE id=$3 AND status='pending'`,
+        [reviewedBy || null, reason || '', req.params.id]
+      );
+    } catch(typeErr) {
+      console.warn('adj reviewed_by type issue (reject), retrying:', typeErr.message);
+      await pool.query(
+        `UPDATE courier_adjustments SET status='rejected', reviewed_at=NOW(),
+         rejection_reason=$1 WHERE id=$2 AND status='pending'`,
+        [reason || '', req.params.id]
+      );
+    }
     res.json({success: true});
-  }catch(e){ res.status(500).json({error: e.message}); }
+  }catch(e){
+    console.error('reject adjustment error:', e.message);
+    res.status(500).json({error: e.message});
+  }
 });
 
 // GET /api/courier-adjustments/:id/proof
