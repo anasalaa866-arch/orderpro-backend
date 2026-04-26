@@ -2412,30 +2412,62 @@ app.get('/api/check-books', async (req, res) => {
 app.post('/api/check-books', async (req, res) => {
   try {
     const { id, name, bank, account, pages, note, firstNum, lastNum } = req.body;
-    console.log('📘 POST /api/check-books:', { id, name, bank, pages, firstNum, lastNum });
-    
+    console.log('📘 POST /api/check-books body:', JSON.stringify(req.body));
+
     if (!DB_ENABLED){
       console.log('⚠️ DB not enabled, returning mock response');
       return res.json({ book: req.body });
     }
-    
-    // إضافة first_num و last_num columns لو مش موجودة
-    try{ 
-      await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1"); 
+
+    if (!id || !name) {
+      console.warn('❌ Missing id or name:', { id, name });
+      return res.status(400).json({ error: 'id and name are required' });
+    }
+
+    // إضافة first_num و last_num columns لو مش موجودة (في try منفصل عشان مايكسرش الـ INSERT)
+    try{
+      await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1");
       await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER");
     }catch(e){ console.warn('alter check_books:', e.message); }
-    
-    console.log('💾 Inserting book into DB...');
-    const result = await pool.query(
-      'INSERT INTO check_books (id,name,bank,account,pages,note,first_num,last_num) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET name=$2,bank=$3,account=$4,pages=$5,note=$6,first_num=$7,last_num=$8 RETURNING *',
-      [id, name, bank||'', account||'', pages||48, note||'', firstNum||1, lastNum||null]
-    );
-    
-    console.log('✅ Book saved successfully:', result.rows[0]);
-    res.json({ book: result.rows[0] });
+
+    // 🆕 v76: استخدام client مخصص عشان نتجنب pool connection issues
+    const client = await pool.connect();
+    try {
+      console.log('💾 Inserting book into DB:', id);
+      const result = await client.query(
+        `INSERT INTO check_books (id, name, bank, account, pages, note, first_num, last_num)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (id) DO UPDATE SET
+           name = EXCLUDED.name,
+           bank = EXCLUDED.bank,
+           account = EXCLUDED.account,
+           pages = EXCLUDED.pages,
+           note = EXCLUDED.note,
+           first_num = EXCLUDED.first_num,
+           last_num = EXCLUDED.last_num
+         RETURNING *`,
+        [
+          String(id),
+          String(name),
+          String(bank || ''),
+          String(account || ''),
+          parseInt(pages) || 48,
+          String(note || ''),
+          parseInt(firstNum) || 1,
+          lastNum ? parseInt(lastNum) : null
+        ]
+      );
+
+      console.log('✅ Book saved successfully:', result.rows[0]?.id);
+      res.json({ book: result.rows[0] });
+    } finally {
+      client.release();
+    }
   } catch(e) {
-    console.error('❌ check-books POST error:', e.message, e.stack);
-    res.status(500).json({ error: e.message });
+    console.error('❌ POST /api/check-books error:', e.message);
+    console.error('❌ Stack:', e.stack);
+    console.error('❌ Body was:', JSON.stringify(req.body));
+    res.status(500).json({ error: e.message, code: e.code, detail: e.detail });
   }
 });
 
@@ -2569,7 +2601,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v75-2026-04-26-checks-fix';
+const SERVER_VERSION = 'v76-2026-04-26-checks-diag';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
