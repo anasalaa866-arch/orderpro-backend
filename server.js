@@ -338,15 +338,19 @@ async function initDB() {
       // ده backfill لمرة واحدة (سيشتغل بدون أي ضرر لو الطلبات صح بالفعل)
       `DO $$
        DECLARE shop_id INTEGER;
+       DECLARE shop_id_text TEXT;
        BEGIN
-         SELECT (value::int) INTO shop_id FROM app_settings WHERE key='shop_courier_id';
-         IF shop_id IS NOT NULL THEN
+         SELECT value INTO shop_id_text FROM app_settings WHERE key='shop_courier_id';
+         IF shop_id_text IS NOT NULL AND shop_id_text ~ '^[0-9]+$' THEN
+           shop_id := shop_id_text::INTEGER;
            UPDATE orders
            SET delivery_type='pickup', updated_at=NOW()
            WHERE courier_id = shop_id
              AND delivery_type != 'pickup'
              AND status IN ('جديد', 'جاري التوصيل', 'تحت التسوية', 'مسوّى', 'مرتجع');
          END IF;
+       EXCEPTION WHEN OTHERS THEN
+         NULL; -- تجاهل أي خطأ، الـ migration ده اختياري
        END $$`,
       "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_orders_courier_id ON orders(courier_id)",
@@ -355,7 +359,13 @@ async function initDB() {
       "CREATE INDEX IF NOT EXISTS idx_orders_courier_status ON orders(courier_id, status)",
     ];
     for (const sql of migrations) {
-      try { await pool.query(sql); } catch(e) {}
+      try {
+        await pool.query(sql);
+      } catch(e) {
+        // اطبع الـ migrations الفاشلة للـ debugging
+        const shortSql = sql.length > 100 ? sql.slice(0, 100) + '...' : sql;
+        console.warn('⚠️ Migration failed (continuing):', e.message, '|', shortSql);
+      }
     }
     console.log('✅ Migrations applied');
 
@@ -2381,12 +2391,22 @@ function shopifyRequest(host, accessToken, path, method = 'GET', body = null) {
 // ===== CHECK BOOKS API =====
 app.get('/api/check-books', async (req, res) => {
   if (!DB_ENABLED) return res.json({ books: [] });
-  const { rows } = await pool.query('SELECT * FROM check_books ORDER BY created_at');
-  res.json({ books: rows.map(r => ({
-    id:r.id, name:r.name, bank:r.bank, account:r.account,
-    pages:r.pages, note:r.note,
-    firstNum: r.first_num||1, lastNum: r.last_num||null
-  })) });
+  try {
+    // تأكد إن العمودين موجودين قبل الـ SELECT (للـ DBs القديمة)
+    try{
+      await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS first_num INTEGER DEFAULT 1");
+      await pool.query("ALTER TABLE check_books ADD COLUMN IF NOT EXISTS last_num INTEGER");
+    }catch(e){}
+    const { rows } = await pool.query('SELECT * FROM check_books ORDER BY created_at');
+    res.json({ books: rows.map(r => ({
+      id:r.id, name:r.name, bank:r.bank, account:r.account,
+      pages:r.pages, note:r.note,
+      firstNum: r.first_num||1, lastNum: r.last_num||null
+    })) });
+  } catch(e) {
+    console.error('❌ GET /api/check-books error:', e.message, e.stack);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/check-books', async (req, res) => {
@@ -2421,40 +2441,60 @@ app.post('/api/check-books', async (req, res) => {
 
 app.delete('/api/check-books/:id', async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
-  await pool.query('DELETE FROM check_books WHERE id=$1', [req.params.id]);
-  res.json({ ok: true });
+  try {
+    await pool.query('DELETE FROM check_books WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('❌ DELETE /api/check-books error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ===== CHECKS API =====
 app.get('/api/checks', async (req, res) => {
   if (!DB_ENABLED) return res.json({ checks: [] });
-  const { rows } = await pool.query('SELECT * FROM checks ORDER BY date ASC');
-  res.json({ checks: rows.map(r => ({
-    id:r.id, num:r.num, payee:r.payee, amount:parseFloat(r.amount),
-    date:r.date ? r.date.toISOString().slice(0,10) : '',
-    bookId:r.book_id, invoice:r.invoice, note:r.note,
-    img:r.img, status:r.status,
-    doneAt:r.done_at, createdAt:r.created_at,
-  })) });
+  try {
+    const { rows } = await pool.query('SELECT * FROM checks ORDER BY date ASC');
+    res.json({ checks: rows.map(r => ({
+      id:r.id, num:r.num, payee:r.payee, amount:parseFloat(r.amount),
+      date:r.date ? r.date.toISOString().slice(0,10) : '',
+      bookId:r.book_id, invoice:r.invoice, note:r.note,
+      img:r.img, status:r.status,
+      doneAt:r.done_at, createdAt:r.created_at,
+    })) });
+  } catch(e) {
+    console.error('❌ GET /api/checks error:', e.message, e.stack);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/checks', async (req, res) => {
-  const { id, num, payee, amount, date, bookId, invoice, note, img, status, doneAt } = req.body;
   if (!DB_ENABLED) return res.json({ check: req.body });
-  await pool.query(
-    `INSERT INTO checks (id,num,payee,amount,date,book_id,invoice,note,img,status,done_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-     ON CONFLICT (id) DO UPDATE SET
-     num=$2,payee=$3,amount=$4,date=$5,book_id=$6,invoice=$7,note=$8,img=$9,status=$10,done_at=$11`,
-    [id, num, payee, amount||0, date||null, bookId||null, invoice||'', note||'', img||'', status||'pending', doneAt||null]
-  );
-  res.json({ check: req.body });
+  try {
+    const { id, num, payee, amount, date, bookId, invoice, note, img, status, doneAt } = req.body;
+    await pool.query(
+      `INSERT INTO checks (id,num,payee,amount,date,book_id,invoice,note,img,status,done_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (id) DO UPDATE SET
+       num=$2,payee=$3,amount=$4,date=$5,book_id=$6,invoice=$7,note=$8,img=$9,status=$10,done_at=$11`,
+      [id, num, payee, amount||0, date||null, bookId||null, invoice||'', note||'', img||'', status||'pending', doneAt||null]
+    );
+    res.json({ check: req.body });
+  } catch(e) {
+    console.error('❌ POST /api/checks error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.delete('/api/checks/:id', async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
-  await pool.query('DELETE FROM checks WHERE id=$1', [req.params.id]);
-  res.json({ ok: true });
+  try {
+    await pool.query('DELETE FROM checks WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('❌ DELETE /api/checks error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Sync bulk - يستقبل كل الشيكات والدفاتر مرة واحدة
@@ -2529,7 +2569,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v74-2026-04-26-perf-shop';
+const SERVER_VERSION = 'v75-2026-04-26-checks-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
