@@ -1190,12 +1190,22 @@ app.post('/api/bosta/create', async (req, res) => {
       packageDetails: {
         numberOfParcels: 1,
         description: packageDescription,  // ⭐ وصف الشحنة = المنتجات
+        // 🆕 v81: قيمة المنتج في specs.packageDetails (الـ Bosta SDK Python بتحطها هنا)
+        items: [{
+          itemName: packageDescription.slice(0, 100),
+          quantity: 1,
+          cod: codAmount,  // مبلغ التحصيل
+          itemValue: orderTotal,  // قيمة المنتج
+        }],
       },
       packageType: 'Parcel',
     },
     cod: codAmount,
-    // قيمة الشحنة (orderValue / packageValue) — Bosta بتسميه أحياناً orderValue
-    orderValue: orderTotal,  // ⭐ قيمة المنتج = total دايماً
+    // 🆕 v81: نحط قيمة المنتج في كل الحقول المحتملة عشان نضمن إن بوسطة هتقبلها
+    orderValue: orderTotal,
+    cashOnDelivery: codAmount,
+    packageValue: orderTotal,
+    productValue: orderTotal,
     dropOffAddress: { city: order.area || 'القاهرة', firstLine: order.addr || order.area || '—' },
     receiver: {
       firstName: nameParts[0] || 'عميل',
@@ -1206,6 +1216,15 @@ app.post('/api/bosta/create', async (req, res) => {
     // 🆕 v79: ملاحظة ثابتة
     notes: 'في حالة حدوث اي مشكلة برجاء الاتصال علي 01080008022',
   };
+
+  // 🆕 v81: log الـ payload للتحقق
+  console.log('📦 Bosta payload:', JSON.stringify({
+    cod: payload.cod,
+    orderValue: payload.orderValue,
+    packageValue: payload.packageValue,
+    cashOnDelivery: payload.cashOnDelivery,
+    items: payload.specs.packageDetails.items,
+  }));
   // pickupAddress مطلوبة دايماً ببوسطة — لازم يكون فيها firstLine
   if (locationId) {
     payload.pickupAddress = {
@@ -1310,10 +1329,32 @@ app.get('/api/bosta/awb/:orderId', async (req, res) => {
   const { rows } = await pool.query('SELECT bosta_awb_base64, bosta_awb_url, bosta_id FROM orders WHERE id=$1', [req.params.orderId]);
   if (!rows[0]) return res.status(404).json({ error: 'الطلب مش موجود' });
   if (rows[0].bosta_awb_base64) {
-    res.json({ success: true, awbBase64: rows[0].bosta_awb_base64, awbUrl: rows[0].bosta_awb_url });
-  } else {
-    res.json({ success: false, bostaId: rows[0].bosta_id, error: 'البوليصة مش محفوظة بعد' });
+    return res.json({ success: true, awbBase64: rows[0].bosta_awb_base64, awbUrl: rows[0].bosta_awb_url });
   }
+
+  // 🆕 v81: لو الـ AWB مش محفوظ، حاول تجيبه من بوسطة فوراً
+  const bostaId = rows[0].bosta_id;
+  const apiKey = req.query.apiKey;
+  const env = req.query.env || 'production';
+  if (bostaId && apiKey) {
+    try {
+      const awbR = await bostaRequest(env, apiKey, '/deliveries/'+bostaId+'/airwaybill', 'GET', null, true);
+      if (awbR.status === 200 && awbR.buffer && awbR.buffer.length > 1000) {
+        const b64 = awbR.buffer.toString('base64');
+        const url = 'data:application/pdf;base64,' + b64;
+        // احفظ في الـ DB للمرة الجاية
+        await pool.query(
+          'UPDATE orders SET bosta_awb_url=$1, bosta_awb_base64=$2, updated_at=NOW() WHERE id=$3',
+          [url, b64, req.params.orderId]
+        ).catch(()=>{});
+        return res.json({ success: true, awbBase64: b64, awbUrl: url, fetchedNow: true });
+      }
+    } catch(e) {
+      console.warn('AWB fetch on demand failed:', e.message);
+    }
+  }
+
+  res.json({ success: false, bostaId, error: 'البوليصة مش محفوظة بعد' });
 });
 
 // ===== SHOPIFY PAGINATION =====
@@ -2688,7 +2729,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v80-2026-04-26-awb-retry';
+const SERVER_VERSION = 'v81-2026-04-26-bosta-value-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
