@@ -1166,17 +1166,46 @@ app.post('/api/bosta/create', async (req, res) => {
   if (!apiKey || !order) return res.status(400).json({ success: false, error: 'بيانات ناقصة' });
   const nameParts = (order.name || '').trim().split(/\s+/);
 
-  // 🆕 v79: بناء وصف الشحنة من المنتجات (زي شيت تصدير بوسطة)
-  let packageDescription = '';
+  // 🆕 v84: لو الـ frontend ما بعتش lineItemsJson، جيبها من الـ DB مباشرة
+  // (في v74 شيلنا lineItemsJson من /api/orders للـ performance)
+  let lineItemsArray = [];
   try {
-    const lineItems = JSON.parse(order.lineItemsJson || order.line_items_json || '[]');
-    if (lineItems.length) {
-      packageDescription = lineItems
-        .map(i => `${i.quantity || 1}x ${i.name || i.title || ''}`.trim())
-        .filter(Boolean)
-        .join(' | ');
+    if (order.lineItemsJson) {
+      lineItemsArray = JSON.parse(order.lineItemsJson);
+    } else if (order.line_items_json) {
+      lineItemsArray = JSON.parse(order.line_items_json);
     }
   } catch (e) {}
+
+  // لو لسه فاضي وعندنا DB، جيب من الـ orders table
+  if (!lineItemsArray.length && DB_ENABLED && order.id) {
+    try {
+      const r = await pool.query('SELECT line_items_json FROM orders WHERE id=$1', [order.id]);
+      if (r.rows[0]?.line_items_json) {
+        lineItemsArray = JSON.parse(r.rows[0].line_items_json);
+        console.log(`📦 Loaded ${lineItemsArray.length} line items from DB for ${order.id}`);
+      }
+    } catch (e) { console.warn('Failed to load line_items from DB:', e.message); }
+  }
+
+  // 🆕 v82: حساب عدد القطع الفعلي من الـ line items (مجموع الـ quantities)
+  let totalParcels = 1;
+  let parcelItems = []; // detailed items list for Bosta
+  let packageDescription = '';
+  if (lineItemsArray.length) {
+    totalParcels = lineItemsArray.reduce((sum, i) => sum + (parseInt(i.quantity) || 1), 0);
+    parcelItems = lineItemsArray.map(i => ({
+      itemName: (i.name || i.title || 'منتج').slice(0, 100),
+      quantity: parseInt(i.quantity) || 1,
+      cod: 0,
+      itemValue: parseFloat(i.price) || 0,
+    }));
+    packageDescription = lineItemsArray
+      .map(i => `${i.quantity || 1}x ${i.name || i.title || ''}`.trim())
+      .filter(Boolean)
+      .join(' | ');
+  }
+
   // fallback: استخدم order.items (string) لو مفيش lineItemsJson
   if (!packageDescription && order.items) {
     packageDescription = order.items;
@@ -1185,21 +1214,6 @@ app.post('/api/bosta/create', async (req, res) => {
   // قص الوصف لو طويل (Bosta عندها limit ~250 char)
   if (packageDescription.length > 240) packageDescription = packageDescription.slice(0, 237) + '...';
 
-  // 🆕 v82: حساب عدد القطع الفعلي من الـ line items (مجموع الـ quantities)
-  let totalParcels = 1;
-  let parcelItems = []; // detailed items list for Bosta
-  try {
-    const lineItems = JSON.parse(order.lineItemsJson || order.line_items_json || '[]');
-    if (lineItems.length) {
-      totalParcels = lineItems.reduce((sum, i) => sum + (parseInt(i.quantity) || 1), 0);
-      parcelItems = lineItems.map(i => ({
-        itemName: (i.name || i.title || 'منتج').slice(0, 100),
-        quantity: parseInt(i.quantity) || 1,
-        cod: 0,
-        itemValue: parseFloat(i.price) || 0,
-      }));
-    }
-  } catch (e) {}
   if (totalParcels < 1) totalParcels = 1;
 
   // 🆕 v79: رقم مرجع الطلب بدون "SH-"
@@ -1282,6 +1296,23 @@ app.post('/api/bosta/create', async (req, res) => {
   }
   try {
     const r = await bostaRequest(env, apiKey, '/deliveries', 'POST', payload);
+
+    // 🆕 v84: log الـ response عشان نشوف ايه القيم اللي Bosta قبلتها فعلاً
+    console.log(`📥 Bosta response status: ${r.status}`);
+    if (r.data) {
+      const d = r.data.data || r.data;
+      console.log('📥 Bosta response data:', JSON.stringify({
+        deliveryId: d._id || d.id,
+        trackingNumber: d.trackingNumber,
+        cod: d.cod,
+        cashOnDelivery: d.cashOnDelivery,
+        orderValue: d.orderValue,
+        packageValue: d.packageValue,
+        specs_packageDetails: d.specs?.packageDetails,
+        message: r.data.message,
+      }, null, 2).slice(0, 1500));
+    }
+
     if (r.status === 200 || r.status === 201) {
       const d = r.data.data || r.data;
       const deliveryId = d._id || d.id;
@@ -2765,7 +2796,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v83-2026-04-26-bosta-defensive';
+const SERVER_VERSION = 'v84-2026-04-26-bosta-debug';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
