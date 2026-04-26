@@ -410,7 +410,7 @@ async function initDB() {
     // ===== v60: امسح invoice cache عشان الفواتير القديمة تتعمل regenerate مع QR code =====
     try {
       const lastVerRes = await pool.query(`SELECT value FROM app_settings WHERE key='last_invoice_template_version'`);
-      const currentTpl = 'compact-a4-v4';  // v71: layout مدمج لطباعة A4 — صفحة واحدة، QR صغير
+      const currentTpl = 'compact-a4-v5';  // v77: إصلاح Shopify CDN resize URL
       if (lastVerRes.rows[0]?.value !== currentTpl) {
         const cleared = await pool.query('DELETE FROM invoice_cache RETURNING order_id');
         await pool.query(
@@ -2282,22 +2282,37 @@ async function enrichLineItemsWithImages(lineItems, host, accessToken) {
     if (!url) return null;
     if (imageBase64Cache[url] !== undefined) return imageBase64Cache[url];
     try {
-      // استخدم Shopify CDN مع size param للتقليل من الحجم
-      // مثال: ../products/coffee.jpg → ../products/coffee_200x200.jpg (~10-20KB بدل 200KB)
-      const sizedUrl = url.replace(/(\.(jpg|jpeg|png|webp))(\?.*)?$/i, '_300x300$1$3');
-      const data = await fetchBinary(sizedUrl);
+      // 🆕 v77: Shopify CDN يستخدم query params للـ resize (مش suffix)
+      // الصيغة الصحيحة: ?width=300 — مش _300x300.jpg
+      let sizedUrl;
+      if (url.includes('cdn.shopify.com') || url.includes('shopify')) {
+        // لو في query params بالفعل، أضف &width=300، وإلا استخدم ?width=300
+        sizedUrl = url.includes('?') ? `${url}&width=300` : `${url}?width=300`;
+      } else {
+        sizedUrl = url; // غير Shopify — استخدم الـ URL كما هو
+      }
+
+      let data = await fetchBinary(sizedUrl);
+
+      // لو الـ resized URL فشل، جرب الـ URL الأصلي
+      if (!data && sizedUrl !== url) {
+        console.warn('Resized URL failed, trying original:', url);
+        data = await fetchBinary(url);
+      }
+
       if (!data) {
-        imageBase64Cache[url] = null;
+        // ⚠️ ما نـ cache الـ failure — لو حصل اتصال مؤقت، الطلب الجاي يحاول تاني
         return null;
       }
-      const ext = (sizedUrl.match(/\.(jpg|jpeg|png|webp)/i) || ['','jpeg'])[1].toLowerCase();
+      // استخرج الـ extension من الـ URL الأصلي (مش الـ sized)
+      const ext = (url.match(/\.(jpg|jpeg|png|webp)/i) || ['','jpeg'])[1].toLowerCase();
       const mime = ext === 'jpg' ? 'jpeg' : ext;
       const b64 = `data:image/${mime};base64,` + data.toString('base64');
       imageBase64Cache[url] = b64;
       return b64;
     } catch(e) {
       console.warn('downloadAsBase64 failed:', url, e.message);
-      imageBase64Cache[url] = null;
+      // ما نـ cache الـ failure
       return null;
     }
   }
@@ -2601,7 +2616,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v76-2026-04-26-checks-diag';
+const SERVER_VERSION = 'v77-2026-04-26-images-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -5090,23 +5105,33 @@ app.get('/api/preparation/order/:id/barcodes', async (req, res) => {
 
 // 🆕 v70: Backfill endpoint — يحمل صور للطلبات اللي معندهاش imageBase64
 // POST /api/admin/backfill-images
-// body: { limit: 50, dryRun: false } — يشغّل على دفعات
+// body: { limit: 50, dryRun: false, retryFailed: true } — يشغّل على دفعات
 app.post('/api/admin/backfill-images', async (req, res) => {
   if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
   const limit = Math.min(parseInt(req.body.limit) || 20, 50);
   const dryRun = req.body.dryRun === true;
+  const retryFailed = req.body.retryFailed !== false; // default true
   try {
-    // جيب الطلبات الـ Shopify اللي ما عندهاش imageBase64
+    // 🆕 v77: نـ retry الطلبات اللي عندها imageBase64=null كمان (بسبب باج CDN URL)
+    const filterClause = retryFailed
+      ? `(
+          line_items_json IS NULL
+          OR line_items_json = ''
+          OR line_items_json NOT LIKE '%imageBase64%'
+          OR line_items_json LIKE '%"imageBase64":null%'
+        )`
+      : `(
+          line_items_json IS NULL
+          OR line_items_json = ''
+          OR line_items_json NOT LIKE '%imageBase64%'
+        )`;
+
     const r = await pool.query(
       `SELECT id, shopify_id, line_items_json, src
        FROM orders
        WHERE src='shopify' AND shopify_id IS NOT NULL
          AND created_at >= NOW() - INTERVAL '30 days'
-         AND (
-           line_items_json IS NULL
-           OR line_items_json = ''
-           OR line_items_json NOT LIKE '%imageBase64%'
-         )
+         AND ${filterClause}
        ORDER BY created_at DESC
        LIMIT $1`,
       [limit]
@@ -5175,16 +5200,21 @@ app.get('/api/admin/backfill-images/status', async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT
-        COUNT(*) FILTER (WHERE line_items_json LIKE '%imageBase64%') as with_images,
-        COUNT(*) FILTER (WHERE line_items_json IS NOT NULL AND line_items_json NOT LIKE '%imageBase64%') as without_images,
+        COUNT(*) FILTER (WHERE line_items_json LIKE '%imageBase64%' AND line_items_json NOT LIKE '%"imageBase64":null%') as with_real_images,
+        COUNT(*) FILTER (WHERE line_items_json LIKE '%"imageBase64":null%') as with_null_images,
+        COUNT(*) FILTER (WHERE line_items_json IS NOT NULL AND line_items_json != '' AND line_items_json NOT LIKE '%imageBase64%') as without_images,
         COUNT(*) FILTER (WHERE line_items_json IS NULL OR line_items_json = '') as no_data
        FROM orders
        WHERE src='shopify' AND created_at >= NOW() - INTERVAL '30 days'`
     );
     res.json({
-      withImages: parseInt(r.rows[0].with_images) || 0,
+      withRealImages: parseInt(r.rows[0].with_real_images) || 0,
+      withNullImages: parseInt(r.rows[0].with_null_images) || 0,
       withoutImages: parseInt(r.rows[0].without_images) || 0,
       noData: parseInt(r.rows[0].no_data) || 0,
+      needsRetry: (parseInt(r.rows[0].with_null_images) || 0) +
+                  (parseInt(r.rows[0].without_images) || 0) +
+                  (parseInt(r.rows[0].no_data) || 0),
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
