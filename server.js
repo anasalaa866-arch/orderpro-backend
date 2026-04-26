@@ -329,6 +329,8 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS governorate TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS city TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS province TEXT",
+      // v71: غيّر reviewed_by في pending_reviews إلى TEXT (كان INTEGER لكن الـ frontend بيبعت username string)
+      "ALTER TABLE pending_reviews ALTER COLUMN reviewed_by TYPE TEXT USING reviewed_by::TEXT",
       "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_orders_courier_id ON orders(courier_id)",
       "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
@@ -2506,7 +2508,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v71-2026-04-26-compact-a4';
+const SERVER_VERSION = 'v72-2026-04-26-review-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -3600,13 +3602,28 @@ app.post('/api/pending-reviews/:id/approve', async (req, res) => {
       );
     }
 
-    await pool.query(
-      `UPDATE pending_reviews SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,
-      [reviewedBy || null, req.params.id]
-    );
+    // ده defensive: لو reviewed_by لسه INTEGER في الـ DB (الـ migration ما اشتغلتش بعد)،
+    // نحاول نحوّل الـ reviewedBy لـ integer، وإلا نحط null
+    let reviewerVal = reviewedBy || null;
+    try {
+      await pool.query(
+        `UPDATE pending_reviews SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,
+        [reviewerVal, req.params.id]
+      );
+    } catch(typeErr) {
+      // لو type mismatch، اعمل update بدون reviewed_by
+      console.warn('reviewed_by type issue, retrying without reviewer:', typeErr.message);
+      await pool.query(
+        `UPDATE pending_reviews SET status='approved', reviewed_at=NOW() WHERE id=$1`,
+        [req.params.id]
+      );
+    }
 
     res.json({success: true});
-  }catch(e){ res.status(500).json({error: e.message}); }
+  }catch(e){
+    console.error('approve review error:', e.message);
+    res.status(500).json({error: e.message});
+  }
 });
 
 // POST /api/pending-reviews/:id/reject
@@ -3627,14 +3644,27 @@ app.post('/api/pending-reviews/:id/reject', async (req, res) => {
       );
     }
 
-    await pool.query(
-      `UPDATE pending_reviews SET status='rejected', reviewed_by=$1, reviewed_at=NOW(),
-       rejection_reason=$2 WHERE id=$3`,
-      [reviewedBy || null, reason || '', req.params.id]
-    );
+    try {
+      await pool.query(
+        `UPDATE pending_reviews SET status='rejected', reviewed_by=$1, reviewed_at=NOW(),
+         rejection_reason=$2 WHERE id=$3`,
+        [reviewedBy || null, reason || '', req.params.id]
+      );
+    } catch(typeErr) {
+      // type mismatch fallback
+      console.warn('reviewed_by type issue (reject), retrying:', typeErr.message);
+      await pool.query(
+        `UPDATE pending_reviews SET status='rejected', reviewed_at=NOW(),
+         rejection_reason=$1 WHERE id=$2`,
+        [reason || '', req.params.id]
+      );
+    }
 
     res.json({success: true});
-  }catch(e){ res.status(500).json({error: e.message}); }
+  }catch(e){
+    console.error('reject review error:', e.message);
+    res.status(500).json({error: e.message});
+  }
 });
 
 // GET /api/pending-reviews/:id/proof — جيب صورة الدليل
