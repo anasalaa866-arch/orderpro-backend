@@ -2616,7 +2616,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v77b-2026-04-26-test-enrich';
+const SERVER_VERSION = 'v77c-2026-04-26-test-enrich-v2';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -5203,11 +5203,18 @@ app.get('/api/admin/test-image-enrich/:orderId', async (req, res) => {
   const log = (msg) => { logs.push(msg); console.log('[test-enrich]', msg); };
 
   try {
-    // 1) جيب الطلب من الـ DB
-    const r = await pool.query('SELECT id, shopify_id FROM orders WHERE id=$1', [orderId]);
-    if (!r.rows.length) return res.json({ ok: false, error: 'Order not found', logs });
+    // 1) جيب الطلب من الـ DB — جرب الـ id كما هو، أو بـ SH- prefix
+    let r = await pool.query('SELECT id, shopify_id FROM orders WHERE id=$1', [orderId]);
+    if (!r.rows.length && !orderId.startsWith('SH-')) {
+      r = await pool.query('SELECT id, shopify_id FROM orders WHERE id=$1', ['SH-' + orderId]);
+    }
+    if (!r.rows.length) {
+      // ممكن يكون شوبيفاي order_number مش الـ id
+      r = await pool.query("SELECT id, shopify_id FROM orders WHERE id LIKE $1 OR shopify_id::text = $2 LIMIT 1", ['%' + orderId, orderId]);
+    }
+    if (!r.rows.length) return res.json({ ok: false, error: 'Order not found', triedIds: [orderId, 'SH-'+orderId], logs });
     const row = r.rows[0];
-    log(`✅ Found order ${orderId}, shopify_id=${row.shopify_id}`);
+    log(`✅ Found order ${row.id}, shopify_id=${row.shopify_id}`);
 
     if (!row.shopify_id) return res.json({ ok: false, error: 'Not a Shopify order', logs });
 
