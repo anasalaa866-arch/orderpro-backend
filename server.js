@@ -333,6 +333,21 @@ async function initDB() {
       "ALTER TABLE pending_reviews ALTER COLUMN reviewed_by TYPE TEXT USING reviewed_by::TEXT",
       // v72: نفس الإصلاح لـ courier_adjustments
       "ALTER TABLE courier_adjustments ALTER COLUMN reviewed_by TYPE TEXT USING reviewed_by::TEXT",
+      // v74: إصلاح طلبات المحل اللي اتوزعت بدون delivery_type='pickup'
+      // كل الطلبات اللي عندها courier_id يساوي SHOP_COURIER_ID لازم delivery_type='pickup'
+      // ده backfill لمرة واحدة (سيشتغل بدون أي ضرر لو الطلبات صح بالفعل)
+      `DO $$
+       DECLARE shop_id INTEGER;
+       BEGIN
+         SELECT (value::int) INTO shop_id FROM app_settings WHERE key='shop_courier_id';
+         IF shop_id IS NOT NULL THEN
+           UPDATE orders
+           SET delivery_type='pickup', updated_at=NOW()
+           WHERE courier_id = shop_id
+             AND delivery_type != 'pickup'
+             AND status IN ('جديد', 'جاري التوصيل', 'تحت التسوية', 'مسوّى', 'مرتجع');
+         END IF;
+       END $$`,
       "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_orders_courier_id ON orders(courier_id)",
       "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
@@ -676,10 +691,14 @@ app.post('/webhook/shopify', async (req, res) => {
 app.get('/api/orders', async (req, res) => {
   if (!DB_ENABLED) return res.json({ orders: memOrders, total: memOrders.length });
   try {
-    // ⚠️ مهم: نشيل bosta_awb_base64 من الـ rows قبل الإرسال (ممكن يكون 100KB+ لكل طلب)
-    // الـ AWB base64 بيتجاب عند الحاجة فقط من /api/orders/:id/awb
+    // ⚠️ مهم: نشيل الـ columns الضخمة من الـ list response (مش بيتاجها الـ frontend للـ table)
+    // - bosta_awb_base64 (100KB+ لكل طلب) — تتجاب من /api/orders/:id/awb
+    // - line_items_json (50KB+ مع base64 صور) — تتجاب وقت الفاتورة فقط
     const { rows } = await pool.query(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 2000`);
-    rows.forEach(r => { delete r.bosta_awb_base64; });
+    rows.forEach(r => {
+      delete r.bosta_awb_base64;
+      delete r.line_items_json; // ⭐ فرق كبير في الأداء
+    });
     res.json({ orders: rows.map(rowToOrder), total: rows.length });
   } catch (e) {
     console.error('GET /api/orders error:', e.message);
@@ -2510,7 +2529,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v73-2026-04-26-adj-fix';
+const SERVER_VERSION = 'v74-2026-04-26-perf-shop';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
