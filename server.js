@@ -941,20 +941,25 @@ app.get('/api/orders/:id/history', async (req, res) => {
     }));
 
     // 🆕 v93: أضف تسويات الطلب من جدول settlements
+    // 🆕 v94: استخدم LIKE بدون quotes لأن الـ JSON متخزّن مع escape characters
     try {
+      // الـ order_ids متخزّن JSON مع escapes (\"SH-x\") — الـ LIKE هيلاقي الـ ID بدون quotes
+      const idVariants = [orderId, 'SH-' + orderId.replace(/^SH-/, '')];
       const settleR = await pool.query(`
-        SELECT s.id, s.ts, s.cod, s.ship, s.notes, s.courier_id, c.name AS courier_name
+        SELECT s.id, s.ts, s.cod, s.ship, s.notes, s.courier_id, s.order_ids,
+               c.name AS courier_name
         FROM settlements s
         LEFT JOIN couriers c ON c.id = s.courier_id
         WHERE s.order_ids LIKE $1 OR s.order_ids LIKE $2
         ORDER BY s.ts DESC
-      `, ['%"' + orderId + '"%', '%"SH-' + orderId.replace(/^SH-/, '') + '"%']);
+      `, ['%' + idVariants[0] + '%', '%' + idVariants[1] + '%']);
 
       for (const s of settleR.rows) {
-        // تأكد إن الطلب فعلاً موجود في الـ JSON (LIKE ممكن يدّي false matches)
+        // تأكد إن الطلب فعلاً موجود في الـ JSON (LIKE بدون quotes ممكن يدّي false matches)
         let parsedIds = [];
         try { parsedIds = JSON.parse(s.order_ids || '[]'); } catch(e) {}
-        if (!parsedIds.includes(orderId) && !parsedIds.includes('SH-' + orderId.replace(/^SH-/, ''))) continue;
+        const matched = parsedIds.some(id => idVariants.includes(id));
+        if (!matched) continue;
 
         history.push({
           id: 'settle_' + s.id,
@@ -2966,7 +2971,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v93-2026-04-27-settle-history';
+const SERVER_VERSION = 'v94-2026-04-27-history-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
