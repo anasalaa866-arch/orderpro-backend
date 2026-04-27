@@ -925,11 +925,12 @@ app.patch('/api/orders/:id', async (req, res) => {
 app.get('/api/orders/:id/history', async (req, res) => {
   if (!DB_ENABLED) return res.json({ history: [] });
   try {
+    const orderId = req.params.id;
     const { rows } = await pool.query(
       'SELECT * FROM order_history WHERE order_id=$1 ORDER BY ts DESC LIMIT 50',
-      [req.params.id]
+      [orderId]
     );
-    res.json({ history: rows.map(r => ({
+    const history = rows.map(r => ({
       id: r.id,
       action: r.action,
       field: r.field,
@@ -937,7 +938,43 @@ app.get('/api/orders/:id/history', async (req, res) => {
       newValue: r.new_value,
       userName: r.user_name,
       ts: r.ts,
-    })) });
+    }));
+
+    // 🆕 v93: أضف تسويات الطلب من جدول settlements
+    try {
+      const settleR = await pool.query(`
+        SELECT s.id, s.ts, s.cod, s.ship, s.notes, s.courier_id, c.name AS courier_name
+        FROM settlements s
+        LEFT JOIN couriers c ON c.id = s.courier_id
+        WHERE s.order_ids LIKE $1 OR s.order_ids LIKE $2
+        ORDER BY s.ts DESC
+      `, ['%"' + orderId + '"%', '%"SH-' + orderId.replace(/^SH-/, '') + '"%']);
+
+      for (const s of settleR.rows) {
+        // تأكد إن الطلب فعلاً موجود في الـ JSON (LIKE ممكن يدّي false matches)
+        let parsedIds = [];
+        try { parsedIds = JSON.parse(s.order_ids || '[]'); } catch(e) {}
+        if (!parsedIds.includes(orderId) && !parsedIds.includes('SH-' + orderId.replace(/^SH-/, ''))) continue;
+
+        history.push({
+          id: 'settle_' + s.id,
+          action: 'تسوية',
+          field: 'settlement',
+          oldValue: '',
+          newValue: `تسوية #${s.id} — مندوب: ${s.courier_name || '#' + s.courier_id} — COD: ${parseFloat(s.cod || 0).toLocaleString()} ج`,
+          userName: s.courier_name || 'system',
+          ts: s.ts,
+          settlementId: s.id, // metadata extra
+        });
+      }
+    } catch (e) {
+      console.warn('Failed to fetch settlements for history:', e.message);
+    }
+
+    // اعد الترتيب بعد إضافة الـ settlements
+    history.sort((a, b) => new Date(b.ts) - new Date(a.ts));
+
+    res.json({ history });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -2929,7 +2966,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v92-2026-04-27-settle-column';
+const SERVER_VERSION = 'v93-2026-04-27-settle-history';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
