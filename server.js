@@ -724,8 +724,10 @@ app.post('/webhook/shopify', async (req, res) => {
           END,
           updated_at=NOW(),
           -- حدّث status بس لو الطلب ملغي على Shopify، أو لو لسه مش موزع
-          -- نحافظ على أي status نهائي/متوسط — بس Shopify cancellation يقدر يلغي
+          -- 🆕 v95: نحافظ على settled_at كمان (مش بيتغير من webhook)
           status=CASE
+            WHEN orders.status='مسوّى' THEN 'مسوّى'
+            WHEN orders.settled_at IS NOT NULL THEN orders.status
             WHEN EXCLUDED.status='ملغي' THEN 'ملغي'
             WHEN orders.status IN ('جاري التوصيل','مكتمل','ملغي','تحت التسوية','مسوّى','مرتجع','ملغي بالميدان','مدمج','تم التسليم') THEN orders.status
             WHEN orders.courier_id IS NOT NULL THEN orders.status
@@ -876,6 +878,19 @@ app.patch('/api/orders/:id', async (req, res) => {
   // جيب القيم القديمة للـ history
   const { rows: oldRows } = await pool.query('SELECT * FROM orders WHERE id=$1', [req.params.id]);
   const oldRow = oldRows[0] || {};
+
+  // 🆕 v95: حماية الطلبات المسوّاة — مينفعش تغيير الـ status لطلب اتسوّى
+  // إلا لو fielded force=true صراحة (للحالات الخاصة)
+  const isSettled = oldRow.status === 'مسوّى' || oldRow.settled_at;
+  if (isSettled && b.status && b.status !== oldRow.status && !b._force) {
+    console.warn(`🛡️ Blocked status change for settled order ${req.params.id}: ${oldRow.status} → ${b.status}`);
+    return res.status(403).json({
+      error: 'لا يمكن تغيير حالة طلب تم تسويته',
+      currentStatus: oldRow.status,
+      attemptedStatus: b.status,
+      hint: 'استخدم _force=true لو إنت متأكد، أو احذف التسوية أولاً'
+    });
+  }
 
   Object.entries(b).forEach(([k, v]) => {
     if (map[k]) {
@@ -2971,7 +2986,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v94-2026-04-27-history-fix';
+const SERVER_VERSION = 'v95-2026-04-27-protect-settled';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
