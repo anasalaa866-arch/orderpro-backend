@@ -2927,7 +2927,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v90-2026-04-27-settle-status';
+const SERVER_VERSION = 'v91-2026-04-27-settle-diagnose';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -3060,6 +3060,105 @@ app.post('/api/settlements', async (req, res) => {
 
 // 🆕 v90: endpoint لإصلاح طلبات اتسوّت لكن status لسه "جاري التوصيل"
 // يستخدم لمرة واحدة لتنظيف البيانات الحالية
+// 🆕 v91: diagnostic endpoint — يشيك على طلب معين ايه حالته ولماذا
+app.get('/api/admin/diagnose-order/:orderId', async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
+  const orderId = req.params.orderId;
+  try{
+    // 1) الحالة الحالية للطلب
+    const orderR = await pool.query(
+      'SELECT id, status, courier_id, settled_at, updated_at FROM orders WHERE id=$1 OR id=$2',
+      [orderId, 'SH-' + orderId.replace(/^SH-/, '')]
+    );
+
+    // 2) كل الـ settlements اللي ممكن يكون فيهم الطلب
+    const settleR = await pool.query(`
+      SELECT id, courier_id, ts, order_ids, cod, ship
+      FROM settlements
+      WHERE order_ids LIKE $1 OR order_ids LIKE $2
+      ORDER BY ts DESC
+    `, ['%"' + orderId + '"%', '%"SH-' + orderId.replace(/^SH-/, '') + '"%']);
+
+    // 3) جرب الـ JSON parsing للـ order_ids
+    const settlements = settleR.rows.map(s => {
+      let parsedIds = null;
+      let parseError = null;
+      try{
+        parsedIds = JSON.parse(s.order_ids || '[]');
+      } catch(e) {
+        parseError = e.message;
+      }
+      return {
+        id: s.id,
+        courierId: s.courier_id,
+        ts: s.ts,
+        rawOrderIds: s.order_ids,
+        parsedOrderIds: parsedIds,
+        parseError,
+        containsOurOrder: parsedIds ? parsedIds.includes(orderId) || parsedIds.includes('SH-' + orderId) : null,
+        cod: s.cod,
+      };
+    });
+
+    res.json({
+      orderId,
+      orderInDB: orderR.rows[0] || null,
+      settlementCount: settleR.rows.length,
+      settlements,
+    });
+  } catch(e) {
+    res.status(500).json({error: e.message, stack: e.stack});
+  }
+});
+
+// 🆕 v91: fix endpoint محسّن — يستخدم LIKE بدل jsonb (الـ jsonb بيفشل لو فيه أي escape characters)
+app.post('/api/admin/fix-settled-orders-v2', async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
+  try{
+    // الخطوة 1: جيب كل الـ settlements
+    const settleR = await pool.query('SELECT id, order_ids FROM settlements');
+
+    // الخطوة 2: استخرج كل الـ order ids من JSON manually في JS (أكثر مرونة من jsonb)
+    const orderIdsToFix = new Set();
+    let parseFailures = 0;
+    for(const s of settleR.rows){
+      try{
+        const ids = JSON.parse(s.order_ids || '[]');
+        if(Array.isArray(ids)) ids.forEach(id => id && orderIdsToFix.add(id));
+      } catch(e) {
+        parseFailures++;
+      }
+    }
+
+    if(!orderIdsToFix.size){
+      return res.json({success: true, fixedCount: 0, message: 'مفيش طلبات في settlements', parseFailures});
+    }
+
+    // الخطوة 3: حدّث الطلبات
+    const idsArray = Array.from(orderIdsToFix);
+    const updateR = await pool.query(`
+      UPDATE orders
+      SET status='مسوّى',
+          settled_at=COALESCE(settled_at, NOW()),
+          updated_at=NOW()
+      WHERE id = ANY($1)
+        AND status IN ('جاري التوصيل', 'مرتجع', 'تحت التسوية', 'جديد')
+      RETURNING id, status
+    `, [idsArray]);
+
+    res.json({
+      success: true,
+      totalSettlementOrders: orderIdsToFix.size,
+      fixedCount: updateR.rows.length,
+      fixedIds: updateR.rows.map(x => x.id),
+      parseFailures,
+    });
+  } catch(e) {
+    console.error('Fix settled orders v2 error:', e.message);
+    res.status(500).json({error: e.message});
+  }
+});
+
 app.post('/api/admin/fix-settled-orders', async (req, res) => {
   if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
   try{
