@@ -2911,7 +2911,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v88-2026-04-27-vendors';
+const SERVER_VERSION = 'v89-2026-04-27-sessions';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -3222,34 +3222,118 @@ app.post('/api/login', async (req, res) => {
 // ============================================================
 
 // Simple courier session tokens (in-memory, 24h TTL)
-const _courierSessions = new Map(); // token -> {courierId, expires}
-const _shopSessions = new Map(); // token -> {shopUserId, username, expires}
+const _courierSessions = new Map(); // token -> {courierId, expires} — cache only
+const _shopSessions = new Map(); // token -> {shopUserId, username, expires} — cache only
 
 function _generateToken(){
   return crypto.randomBytes(32).toString('hex');
 }
 
-function _cleanupExpiredSessions(){
+// 🆕 v89: نضمن جدول courier_sessions موجود (للـ persistence عبر restarts)
+async function _ensureSessionsTable(){
+  if(!DB_ENABLED) return;
+  try{
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS courier_sessions (
+        token TEXT PRIMARY KEY,
+        courier_id TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_courier_sessions_expires ON courier_sessions(expires_at)`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS shop_sessions (
+        token TEXT PRIMARY KEY,
+        shop_user_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_shop_sessions_expires ON shop_sessions(expires_at)`);
+    console.log('✅ Sessions tables ready');
+  }catch(e){
+    console.warn('⚠️ Sessions table init failed:', e.message);
+  }
+}
+_ensureSessionsTable();
+
+async function _cleanupExpiredSessions(){
   const now = Date.now();
+  // مسح من الـ memory cache
   for(const [token, session] of _courierSessions.entries()){
     if(session.expires < now) _courierSessions.delete(token);
   }
   for(const [token, session] of _shopSessions.entries()){
     if(session.expires < now) _shopSessions.delete(token);
   }
+  // مسح من الـ DB
+  if(DB_ENABLED){
+    try{
+      await pool.query('DELETE FROM courier_sessions WHERE expires_at < NOW()');
+      await pool.query('DELETE FROM shop_sessions WHERE expires_at < NOW()');
+    }catch(e){}
+  }
 }
 setInterval(_cleanupExpiredSessions, 60 * 60 * 1000); // every hour
 
+// 🆕 v89: helper لتحميل session من الـ DB لو مش في الـ cache
+async function _loadCourierSessionFromDB(token){
+  if(!DB_ENABLED) return null;
+  try{
+    const r = await pool.query(
+      'SELECT courier_id, expires_at FROM courier_sessions WHERE token=$1 AND expires_at > NOW()',
+      [token]
+    );
+    if(!r.rows.length) return null;
+    const session = {
+      courierId: r.rows[0].courier_id,
+      expires: new Date(r.rows[0].expires_at).getTime()
+    };
+    _courierSessions.set(token, session); // cache it
+    return session;
+  }catch(e){ return null; }
+}
+
+async function _loadShopSessionFromDB(token){
+  if(!DB_ENABLED) return null;
+  try{
+    const r = await pool.query(
+      'SELECT shop_user_id, username, expires_at FROM shop_sessions WHERE token=$1 AND expires_at > NOW()',
+      [token]
+    );
+    if(!r.rows.length) return null;
+    const session = {
+      shopUserId: r.rows[0].shop_user_id,
+      username: r.rows[0].username,
+      expires: new Date(r.rows[0].expires_at).getTime()
+    };
+    _shopSessions.set(token, session);
+    return session;
+  }catch(e){ return null; }
+}
+
 // Middleware: validates courier token
-function courierAuth(req, res, next){
+async function courierAuth(req, res, next){
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   if(!token) return res.status(401).json({error: 'No token'});
 
-  const session = _courierSessions.get(token);
+  // الأول جرب الـ cache (سريع)
+  let session = _courierSessions.get(token);
+
+  // لو مش في الـ cache، جرب الـ DB (بيحصل بعد restart)
+  if(!session){
+    session = await _loadCourierSessionFromDB(token);
+  }
+
   if(!session) return res.status(401).json({error: 'Invalid or expired token'});
 
   if(session.expires < Date.now()){
     _courierSessions.delete(token);
+    if(DB_ENABLED){
+      pool.query('DELETE FROM courier_sessions WHERE token=$1', [token]).catch(()=>{});
+    }
     return res.status(401).json({error: 'Session expired'});
   }
 
@@ -3273,8 +3357,19 @@ app.post('/api/courier/login', async (req, res) => {
 
     const courier = r.rows[0];
     const token = _generateToken();
-    const expires = Date.now() + 24 * 60 * 60 * 1000; // 24h
+    // 🆕 v89: 30 يوم بدل 24 ساعة عشان المناديب ما يضطروش يسجلوا دخول كل يوم
+    const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
     _courierSessions.set(token, {courierId: courier.id, expires});
+
+    // 🆕 v89: احفظ في الـ DB كمان عشان تفضل لما السيرفر يعيد التشغيل
+    try{
+      await pool.query(
+        `INSERT INTO courier_sessions (token, courier_id, expires_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (token) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+        [token, courier.id, new Date(expires)]
+      );
+    }catch(e){ console.warn('Failed to persist session:', e.message); }
 
     // سجل آخر دخول
     await pool.query('UPDATE couriers SET last_login_at=NOW() WHERE id=$1', [courier.id]).catch(()=>{});
@@ -4179,13 +4274,21 @@ app.get('/api/courier-adjustments/:id/proof', async (req, res) => {
 // ===== CAFELAX STARS — SHOP MODE (موظف المحل) =====
 // ============================================================
 
-function shopAuth(req, res, next){
+async function shopAuth(req, res, next){
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   if(!token) return res.status(401).json({error: 'No token'});
-  const session = _shopSessions.get(token);
+
+  let session = _shopSessions.get(token);
+  if(!session){
+    session = await _loadShopSessionFromDB(token);
+  }
   if(!session) return res.status(401).json({error: 'Invalid or expired token'});
+
   if(session.expires < Date.now()){
     _shopSessions.delete(token);
+    if(DB_ENABLED){
+      pool.query('DELETE FROM shop_sessions WHERE token=$1', [token]).catch(()=>{});
+    }
     return res.status(401).json({error: 'Session expired'});
   }
   req.shopUserId = session.shopUserId;
@@ -4207,8 +4310,18 @@ app.post('/api/shop/login', async (req, res) => {
     if(!r.rows.length) return res.json({success: false, error: 'خطأ في اسم المستخدم أو كلمة المرور'});
     const u = r.rows[0];
     const token = _generateToken();
-    const expires = Date.now() + 24 * 60 * 60 * 1000;
+    // 🆕 v89: 30 يوم بدل 24 ساعة
+    const expires = Date.now() + 30 * 24 * 60 * 60 * 1000;
     _shopSessions.set(token, {shopUserId: u.id, username: u.username, expires});
+    // 🆕 v89: احفظ في الـ DB
+    try{
+      await pool.query(
+        `INSERT INTO shop_sessions (token, shop_user_id, username, expires_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (token) DO UPDATE SET expires_at = EXCLUDED.expires_at`,
+        [token, u.id, u.username, new Date(expires)]
+      );
+    }catch(e){ console.warn('Failed to persist shop session:', e.message); }
     await pool.query('UPDATE shop_users SET last_login_at=NOW() WHERE id=$1', [u.id]).catch(()=>{});
     res.json({
       success: true,
