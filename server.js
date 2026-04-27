@@ -138,6 +138,14 @@ async function initDB() {
         done_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS vendors (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        phone TEXT,
+        note TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
     // جدول المستخدمين
     await pool.query(`
@@ -357,6 +365,32 @@ async function initDB() {
       "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
       "CREATE INDEX IF NOT EXISTS idx_orders_delivery_type ON orders(delivery_type)",
       "CREATE INDEX IF NOT EXISTS idx_orders_courier_status ON orders(courier_id, status)",
+      // v88: نقل الموردين الموجودين من checks.payee لجدول vendors
+      // ده backfill لمرة واحدة (آمن لو اشتغل أكثر من مرة بسبب ON CONFLICT)
+      `INSERT INTO vendors (id, name, created_at)
+       SELECT
+         'v_' || md5(TRIM(payee)) AS id,
+         TRIM(payee) AS name,
+         MIN(created_at) AS created_at
+       FROM checks
+       WHERE payee IS NOT NULL AND TRIM(payee) != ''
+       GROUP BY TRIM(payee)
+       ON CONFLICT (name) DO NOTHING`,
+      // v88: نقل الموردين كمان من جدول check_suppliers القديم (لو موجود)
+      `DO $$
+       BEGIN
+         IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='check_suppliers') THEN
+           INSERT INTO vendors (id, name, created_at)
+           SELECT
+             COALESCE(id, 'v_' || md5(TRIM(name))) AS id,
+             TRIM(name) AS name,
+             NOW() AS created_at
+           FROM check_suppliers
+           WHERE name IS NOT NULL AND TRIM(name) != ''
+           ON CONFLICT (name) DO NOTHING;
+         END IF;
+       EXCEPTION WHEN OTHERS THEN NULL;
+       END $$`,
     ];
     for (const sql of migrations) {
       try {
@@ -2665,6 +2699,99 @@ app.delete('/api/check-books/:id', async (req, res) => {
   }
 });
 
+// ===== VENDORS API =====
+app.get('/api/vendors', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ vendors: [] });
+  try {
+    const { rows } = await pool.query('SELECT * FROM vendors ORDER BY name ASC');
+    res.json({ vendors: rows.map(r => ({
+      id: r.id,
+      name: r.name,
+      phone: r.phone || '',
+      note: r.note || '',
+      createdAt: r.created_at,
+    })) });
+  } catch(e) {
+    console.error('❌ GET /api/vendors error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/vendors', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ vendor: req.body });
+  try {
+    const { id, name, phone, note } = req.body;
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: 'الاسم مطلوب' });
+    }
+    const finalId = id || ('v_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7));
+    const finalName = String(name).trim();
+    const result = await pool.query(
+      `INSERT INTO vendors (id, name, phone, note)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (name) DO UPDATE SET
+         phone = EXCLUDED.phone,
+         note = EXCLUDED.note
+       RETURNING *`,
+      [finalId, finalName, String(phone || '').trim(), String(note || '').trim()]
+    );
+    const r = result.rows[0];
+    res.json({ vendor: { id: r.id, name: r.name, phone: r.phone || '', note: r.note || '' } });
+  } catch(e) {
+    console.error('❌ POST /api/vendors error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/vendors/:id', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ ok: true });
+  try {
+    const { name, phone, note } = req.body;
+    const sets = [];
+    const vals = [];
+    if (name !== undefined) { sets.push(`name=$${vals.length+1}`); vals.push(String(name).trim()); }
+    if (phone !== undefined) { sets.push(`phone=$${vals.length+1}`); vals.push(String(phone || '').trim()); }
+    if (note !== undefined) { sets.push(`note=$${vals.length+1}`); vals.push(String(note || '').trim()); }
+    if (!sets.length) return res.status(400).json({ error: 'لا يوجد بيانات للتحديث' });
+    vals.push(req.params.id);
+    const result = await pool.query(
+      `UPDATE vendors SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING *`,
+      vals
+    );
+    if (!result.rows[0]) return res.status(404).json({ error: 'المورد غير موجود' });
+    const r = result.rows[0];
+    res.json({ vendor: { id: r.id, name: r.name, phone: r.phone || '', note: r.note || '' } });
+  } catch(e) {
+    console.error('❌ PATCH /api/vendors error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/vendors/:id', async (req, res) => {
+  if (!DB_ENABLED) return res.json({ ok: true });
+  try {
+    // ⚠️ شيك إذا كان فيه شيكات للمورد ده
+    const checkR = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM checks
+       WHERE payee = (SELECT name FROM vendors WHERE id=$1)`,
+      [req.params.id]
+    );
+    const checksCount = checkR.rows[0]?.cnt || 0;
+    if (checksCount > 0 && !req.query.force) {
+      return res.status(409).json({
+        error: 'المورد له شيكات',
+        checksCount,
+        message: `هذا المورد له ${checksCount} شيك. أضف ?force=1 للحذف رغم ذلك (الشيكات هتتحفظ بنفس الاسم).`
+      });
+    }
+    await pool.query('DELETE FROM vendors WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('❌ DELETE /api/vendors error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ===== CHECKS API =====
 app.get('/api/checks', async (req, res) => {
   if (!DB_ENABLED) return res.json({ checks: [] });
@@ -2784,7 +2911,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v87-2026-04-27-limit-5000';
+const SERVER_VERSION = 'v88-2026-04-27-vendors';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
