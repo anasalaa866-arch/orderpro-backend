@@ -704,7 +704,7 @@ app.get('/api/orders', async (req, res) => {
     // ⚠️ مهم: نشيل الـ columns الضخمة من الـ list response (مش بيتاجها الـ frontend للـ table)
     // - bosta_awb_base64 (100KB+ لكل طلب) — تتجاب من /api/orders/:id/awb
     // - line_items_json (50KB+ مع base64 صور) — تتجاب وقت الفاتورة فقط
-    const { rows } = await pool.query(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 2000`);
+    const { rows } = await pool.query(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 5000`);
     rows.forEach(r => {
       delete r.bosta_awb_base64;
       delete r.line_items_json; // ⭐ فرق كبير في الأداء
@@ -1234,70 +1234,54 @@ app.post('/api/bosta/create', async (req, res) => {
     }];
   }
 
+  // 🆕 v86: الـ payload الصحيح بناءً على الـ network call من Bosta dashboard
   const payload = {
     type: 10,
-    // 🆕 v85: Bosta SDK الرسمي بيستخدم اسم "specs" — جربنا و ما اشتغلش
-    // المرة دي نبعت بـ deliverySpecs مع الـ structure الصحيحة
+    // ⭐ الـ field الصحيح للقيمة: goodsInfo.amount (كـ string)
+    goodsInfo: {
+      amount: String(orderTotal),
+    },
+    // ⭐ COD كـ string
+    cod: String(codAmount),
+    // ⭐ specs بالشكل الصحيح
     specs: {
       packageDetails: {
-        numberOfParcels: totalParcels,
+        itemsCount: totalParcels,
         description: packageDescription,
-        // 🆕 v85: documentValue هو اسم القيمة عند بوسطة في بعض الإصدارات
-        documentValue: orderTotal,
       },
-      packageType: 'Parcel',
-      size: 'SMALL',
+      packageType: 'Small',
     },
-    // الـ COD = مبلغ التحصيل (بيظهر تحت "مبلغ التحصيل" في البوليصة)
-    cod: codAmount,
-    // 🆕 v85: cashOnDelivery منفصلة عن orderValue حسب SDK
-    cashOnDelivery: codAmount,
-    // 🆕 v85: قيمة المنتج / الطرد — بنحطها في الفيلد الموحدة
-    // amount عادة بيشير لـ value في الـ legacy API
-    amount: orderTotal,
-    orderValue: orderTotal,
-    packageValue: orderTotal,
-    productValue: orderTotal,
-    declaredValue: orderTotal,
-    items: parcelItems,  // الـ items بشكل منفصل في الـ root
-    dropOffAddress: { city: order.area || 'القاهرة', firstLine: order.addr || order.area || '—' },
+    allowToOpenPackage: false,
+    payWithBostaCredits: false,
+    dropOffAddress: {
+      city: order.area || 'القاهرة',
+      firstLine: order.addr || order.area || '—',
+    },
+    // ⭐ receiver بـ fullName (مش firstName/lastName)
     receiver: {
-      firstName: nameParts[0] || 'عميل',
-      lastName: nameParts.slice(1).join(' ') || '.',
       phone: (order.phone || '01000000000').replace(/[^0-9+]/g, ''),
+      fullName: order.name || 'عميل',
     },
     businessReference: businessRef,
     notes: 'في حالة حدوث اي مشكلة برجاء الاتصال علي 01080008022',
   };
 
-  // 🆕 v82: log أوضح للـ payload
-  console.log('📦 Bosta payload summary:', JSON.stringify({
+  // pickup location
+  if (locationId) {
+    payload.businessLocationId = locationId;
+  }
+
+  // 🆕 v86: log أوضح
+  console.log('📦 Bosta payload (v86):', JSON.stringify({
     orderId: order.id,
     cod: payload.cod,
-    orderValue: payload.orderValue,
-    totalParcels,
-    parcelItemsCount: parcelItems.length,
-    description: packageDescription.slice(0, 50),
+    'goodsInfo.amount': payload.goodsInfo.amount,
+    'specs.packageDetails.itemsCount': payload.specs.packageDetails.itemsCount,
+    'specs.packageType': payload.specs.packageType,
+    receiver: payload.receiver,
   }));
-  // pickupAddress مطلوبة دايماً ببوسطة — لازم يكون فيها firstLine
-  if (locationId) {
-    payload.pickupAddress = {
-      _id: locationId,
-      firstLine: order.pickupAddress || 'المحل',
-      city: 'القاهرة',
-    };
-  } else if (order.pickupAddress) {
-    payload.pickupAddress = {
-      firstLine: order.pickupAddress,
-      city: 'القاهرة',
-    };
-  } else {
-    // fallback — اسم المحل كعنوان استلام
-    payload.pickupAddress = {
-      firstLine: order.businessName || 'المحل',
-      city: 'القاهرة',
-    };
-  }
+
+
   try {
     const r = await bostaRequest(env, apiKey, '/deliveries', 'POST', payload);
 
@@ -2800,7 +2784,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v85-2026-04-26-bosta-value';
+const SERVER_VERSION = 'v87-2026-04-27-limit-5000';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
