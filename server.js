@@ -391,6 +391,22 @@ async function initDB() {
          END IF;
        EXCEPTION WHEN OTHERS THEN NULL;
        END $$`,
+      // v90: إصلاح الطلبات اللي اتسوّت لكن status لسة "جاري التوصيل" (race condition)
+      // ده backfill لمرة واحدة، آمن (UPDATE فقط للـ orders اللي فعلاً موجودة في settlements)
+      `DO $$
+       BEGIN
+         UPDATE orders
+         SET status='مسوّى',
+             settled_at=COALESCE(settled_at, NOW()),
+             updated_at=NOW()
+         WHERE id IN (
+           SELECT DISTINCT jsonb_array_elements_text(order_ids::jsonb)
+           FROM settlements
+         )
+         AND status IN ('جاري التوصيل', 'مرتجع', 'تحت التسوية');
+       EXCEPTION WHEN OTHERS THEN
+         NULL;
+       END $$`,
     ];
     for (const sql of migrations) {
       try {
@@ -2911,7 +2927,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v89-2026-04-27-sessions';
+const SERVER_VERSION = 'v90-2026-04-27-settle-status';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -3019,8 +3035,53 @@ app.post('/api/settlements', async (req, res) => {
       'UPDATE couriers SET settled=true WHERE id=$1',
       [courierId]
     );
+
+    // 🆕 v90: حدّث الطلبات نفسها لـ "مسوّى" — ده اللي كان ناقص!
+    // بدون ده الطلبات بتفضل status="جاري التوصيل" و بتظهر للمندوب
+    if(orderIds && orderIds.length){
+      const updateResult = await pool.query(
+        `UPDATE orders
+         SET status='مسوّى',
+             settled_at=NOW(),
+             updated_at=NOW()
+         WHERE id = ANY($1) AND status IN ('جاري التوصيل', 'مرتجع', 'تحت التسوية')
+         RETURNING id`,
+        [orderIds]
+      );
+      console.log(`✅ Settlement ${r.rows[0].id}: updated ${updateResult.rows.length}/${orderIds.length} orders to مسوّى`);
+    }
+
     res.json({success:true, id:r.rows[0].id});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){
+    console.error('❌ POST /api/settlements error:', e.message);
+    res.status(500).json({error:e.message});
+  }
+});
+
+// 🆕 v90: endpoint لإصلاح طلبات اتسوّت لكن status لسه "جاري التوصيل"
+// يستخدم لمرة واحدة لتنظيف البيانات الحالية
+app.post('/api/admin/fix-settled-orders', async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
+  try{
+    // كل الطلبات اللي موجودة في settlements لكن status لسه "جاري التوصيل"
+    const r = await pool.query(`
+      WITH settled_order_ids AS (
+        SELECT DISTINCT jsonb_array_elements_text(order_ids::jsonb) AS oid
+        FROM settlements
+      )
+      UPDATE orders
+      SET status='مسوّى',
+          settled_at=COALESCE(settled_at, NOW()),
+          updated_at=NOW()
+      WHERE id IN (SELECT oid FROM settled_order_ids)
+        AND status IN ('جاري التوصيل', 'مرتجع', 'تحت التسوية')
+      RETURNING id
+    `);
+    res.json({success:true, fixedCount: r.rows.length, fixedIds: r.rows.map(x=>x.id)});
+  }catch(e){
+    console.error('Fix settled orders error:', e.message);
+    res.status(500).json({error:e.message});
+  }
 });
 
 // حذف تسوية (للتراجع)
