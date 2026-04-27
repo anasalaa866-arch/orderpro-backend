@@ -337,6 +337,8 @@ async function initDB() {
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS governorate TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS city TEXT",
       "ALTER TABLE orders ADD COLUMN IF NOT EXISTS province TEXT",
+      // 🆕 v92: العمود اللي كان ناقص — ده اللي خلى الطلبات تفضل "جاري التوصيل" بعد التسوية
+      "ALTER TABLE orders ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ",
       // v71: غيّر reviewed_by في pending_reviews إلى TEXT (كان INTEGER لكن الـ frontend بيبعت username string)
       "ALTER TABLE pending_reviews ALTER COLUMN reviewed_by TYPE TEXT USING reviewed_by::TEXT",
       // v72: نفس الإصلاح لـ courier_adjustments
@@ -2927,7 +2929,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v91-2026-04-27-settle-diagnose';
+const SERVER_VERSION = 'v92-2026-04-27-settle-column';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
