@@ -274,6 +274,23 @@ async function initDB() {
       "CREATE INDEX IF NOT EXISTS idx_courier_adjustments_courier ON courier_adjustments(courier_id)",
       "CREATE INDEX IF NOT EXISTS idx_courier_adjustments_status ON courier_adjustments(status)",
 
+      // 🆕 v101: جدول طلبات تحويل الشحن (المندوب يطلب تحويل لمندوب تاني/بوسطة)
+      `CREATE TABLE IF NOT EXISTS shipping_transfer_requests (
+        id SERIAL PRIMARY KEY,
+        order_id TEXT NOT NULL,
+        from_courier_id INTEGER NOT NULL,
+        target_type TEXT NOT NULL,
+        target_courier_id INTEGER,
+        reason TEXT,
+        status TEXT DEFAULT 'pending',
+        reviewed_by TEXT,
+        reviewed_at TIMESTAMPTZ,
+        rejection_reason TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
+      "CREATE INDEX IF NOT EXISTS idx_str_status ON shipping_transfer_requests(status)",
+      "CREATE INDEX IF NOT EXISTS idx_str_order ON shipping_transfer_requests(order_id)",
+
       // صلاحية محاسبة المناديب (للمستخدمين)
       "ALTER TABLE users ADD COLUMN IF NOT EXISTS can_settle_couriers BOOLEAN DEFAULT false",
 
@@ -363,6 +380,7 @@ async function initDB() {
          NULL; -- تجاهل أي خطأ، الـ migration ده اختياري
        END $$`,
       "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_orders_updated_at ON orders(updated_at DESC)",
       "CREATE INDEX IF NOT EXISTS idx_orders_courier_id ON orders(courier_id)",
       "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
       "CREATE INDEX IF NOT EXISTS idx_orders_delivery_type ON orders(delivery_type)",
@@ -406,6 +424,24 @@ async function initDB() {
            FROM settlements
          )
          AND status IN ('جاري التوصيل', 'مرتجع', 'تحت التسوية');
+       EXCEPTION WHEN OTHERS THEN
+         NULL;
+       END $$`,
+      // 🆕 v96: ربط الـ approved adjustments المعلقة بأقرب تسوية بعد تاريخ موافقتها
+      // ده backfill يصلح الحالة اللي حصلت (تعديلات معتمدة لكن مش مرتبطة بتسوية)
+      `DO $$
+       BEGIN
+         UPDATE courier_adjustments ca
+         SET settlement_id = (
+           SELECT s.id
+           FROM settlements s
+           WHERE s.courier_id = ca.courier_id
+             AND s.ts >= COALESCE(ca.reviewed_at, ca.created_at)
+           ORDER BY s.ts ASC
+           LIMIT 1
+         )
+         WHERE ca.status = 'approved'
+           AND ca.settlement_id IS NULL;
        EXCEPTION WHEN OTHERS THEN
          NULL;
        END $$`,
@@ -486,6 +522,108 @@ app.use(cors({ origin: '*' }));
 app.use('/webhook/shopify', express.raw({ type: 'application/json' }));
 app.use(express.json({ limit: '10mb' }));
 
+// 🔒 v103: منع الفهرسة من محركات البحث وحجب AI crawlers
+// list of known AI/scraper user agents to block
+const _BLOCKED_BOTS = [
+  'gptbot', 'chatgpt-user', 'oai-searchbot',           // OpenAI
+  'claudebot', 'claude-web', 'anthropic-ai',           // Anthropic
+  'perplexitybot', 'perplexity-user',                  // Perplexity
+  'google-extended', 'googleother',                    // Google AI training
+  'ccbot',                                             // Common Crawl (used by many AI)
+  'bytespider',                                        // ByteDance/TikTok
+  'amazonbot',                                         // Amazon
+  'applebot-extended',                                 // Apple AI
+  'cohere-ai',                                         // Cohere
+  'meta-externalagent', 'facebookbot',                 // Meta AI
+  'mistralai-user',                                    // Mistral
+  'youbot',                                            // You.com
+  'diffbot',                                           // Diffbot
+  'omgili', 'omgilibot',                               // Webz.io
+  'magpie-crawler', 'twitterbot',                      // Various
+  'semrushbot', 'ahrefsbot', 'mj12bot', 'dotbot',     // SEO scrapers
+];
+
+app.use((req, res, next) => {
+  // 1) ابعت X-Robots-Tag في كل response
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive, nosnippet, noimageindex');
+
+  // 2) احجب الـ AI/scraper bots
+  const ua = (req.headers['user-agent'] || '').toLowerCase();
+  if(_BLOCKED_BOTS.some(bot => ua.includes(bot))){
+    return res.status(403).send('Access denied');
+  }
+  next();
+});
+
+// 🔒 v103: robots.txt — يقول لكل الـ bots متفهرسش حاجة
+app.get('/robots.txt', (req, res) => {
+  res.type('text/plain');
+  res.send(`User-agent: *
+Disallow: /
+
+# Block known AI training crawlers
+User-agent: GPTBot
+Disallow: /
+
+User-agent: ChatGPT-User
+Disallow: /
+
+User-agent: OAI-SearchBot
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: Claude-Web
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: PerplexityBot
+Disallow: /
+
+User-agent: Perplexity-User
+Disallow: /
+
+User-agent: Google-Extended
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: ByteSpider
+Disallow: /
+
+User-agent: Amazonbot
+Disallow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+User-agent: cohere-ai
+Disallow: /
+
+User-agent: Meta-ExternalAgent
+Disallow: /
+
+User-agent: FacebookBot
+Disallow: /
+
+User-agent: MistralAI-User
+Disallow: /
+
+User-agent: YouBot
+Disallow: /
+
+User-agent: Diffbot
+Disallow: /
+
+User-agent: omgili
+Disallow: /
+`);
+});
+
 // ===== SERVE BOSTA TEMPLATE =====
 app.get('/bosta-template.xlsx', (req, res) => {
   const templatePath = path.join(__dirname, 'bosta-template.xlsx');
@@ -499,7 +637,7 @@ app.get('/bosta-template.xlsx', (req, res) => {
 });
 
 // ===== AI CHAT =====
-app.post('/api/ai/chat', async (req, res) => {
+app.post('/api/ai/chat', adminAuth, async (req, res) => {
   const { message, history, context } = req.body;
   if (!process.env.ANTHROPIC_API_KEY) {
     return res.status(500).json({ error: 'ANTHROPIC_API_KEY غير مضبوط' });
@@ -752,9 +890,28 @@ app.post('/webhook/shopify', async (req, res) => {
 });
 
 // ===== ORDERS API =====
-app.get('/api/orders', async (req, res) => {
+app.get('/api/orders', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ orders: memOrders, total: memOrders.length });
   try {
+    // 🆕 v99: conditional GET — لو مفيش تغيير منذ آخر طلب، نرجع 304 Not Modified
+    // ده بيوفر bandwidth و CPU بشكل كبير لما الـ frontend بيـ poll كل 30 ثانية
+    const ifModifiedSince = req.headers['if-modified-since'];
+
+    // جيب آخر تحديث في الـ DB (سريع جداً مع الـ index)
+    const lastUpdR = await pool.query(
+      'SELECT MAX(updated_at) as last_upd FROM orders LIMIT 1'
+    );
+    const lastUpd = lastUpdR.rows[0]?.last_upd;
+
+    if (ifModifiedSince && lastUpd) {
+      const clientTime = new Date(ifModifiedSince).getTime();
+      const serverTime = new Date(lastUpd).getTime();
+      // round to second precision (HTTP date precision)
+      if (Math.floor(clientTime / 1000) >= Math.floor(serverTime / 1000)) {
+        return res.status(304).end();
+      }
+    }
+
     // ⚠️ مهم: نشيل الـ columns الضخمة من الـ list response (مش بيتاجها الـ frontend للـ table)
     // - bosta_awb_base64 (100KB+ لكل طلب) — تتجاب من /api/orders/:id/awb
     // - line_items_json (50KB+ مع base64 صور) — تتجاب وقت الفاتورة فقط
@@ -763,6 +920,13 @@ app.get('/api/orders', async (req, res) => {
       delete r.bosta_awb_base64;
       delete r.line_items_json; // ⭐ فرق كبير في الأداء
     });
+
+    // أضف Last-Modified header للـ response
+    if (lastUpd) {
+      res.set('Last-Modified', new Date(lastUpd).toUTCString());
+      res.set('Cache-Control', 'private, must-revalidate');
+    }
+
     res.json({ orders: rows.map(rowToOrder), total: rows.length });
   } catch (e) {
     console.error('GET /api/orders error:', e.message);
@@ -771,7 +935,7 @@ app.get('/api/orders', async (req, res) => {
 });
 
 // /api/orders/:id/awb — يرجع الـ AWB base64 لطلب واحد عند الحاجة
-app.get('/api/orders/:id/awb', async (req, res) => {
+app.get('/api/orders/:id/awb', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
   try {
     const r = await pool.query('SELECT bosta_awb_base64, bosta_awb_url FROM orders WHERE id=$1', [req.params.id]);
@@ -785,11 +949,13 @@ app.get('/api/orders/:id/awb', async (req, res) => {
   }
 });
 
-app.post('/api/orders', async (req, res) => {
+app.post('/api/orders', adminAuth, async (req, res) => {
   const o = req.body;
   const id = o.id || 'MN-' + Date.now();
   const now = new Date().toISOString();
-  const newOrder = { id, src:o.src||'manual', name:o.name, phone:o.phone||'—', area:o.area, addr:o.addr||o.area, total:o.total||0, ship:o.ship||50, courierId:o.courierId||null, status:o.status||'في الانتظار', paid:o.paid||false, deliveryType:o.deliveryType||'normal', note:o.note||'', items:o.items||'', time:o.time||new Date().toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}), createdAt:now };
+  // 🆕 v100: total ممكن يكون 0 أو سالب (لو المندوب هيدي للعميل) — استخدم ?? بدل ||
+  const totalVal = (o.total != null && o.total !== '') ? parseFloat(o.total) : 0;
+  const newOrder = { id, src:o.src||'manual', name:o.name, phone:o.phone||'—', area:o.area, addr:o.addr||o.area, total: isNaN(totalVal) ? 0 : totalVal, ship:o.ship||50, courierId:o.courierId||null, status:o.status||'في الانتظار', paid:o.paid||false, deliveryType:o.deliveryType||'normal', note:o.note||'', items:o.items||'', time:o.time||new Date().toLocaleTimeString('ar-EG',{hour:'2-digit',minute:'2-digit'}), createdAt:now };
   if (!DB_ENABLED) {
     if (!memOrders.find(x=>x.id===id)) memOrders.unshift(newOrder);
     return res.json({ order: newOrder });
@@ -820,7 +986,7 @@ async function logOrderHistory(orderId, action, details={}) {
 }
 
 // ===== MERGE ORDERS =====
-app.post('/api/orders/merge', async (req, res) => {
+app.post('/api/orders/merge', adminAuth, async (req, res) => {
   const { primaryId, secondaryIds, mergedTotal, mergedItems, mergedLineItemsJson, shipMode, shipCost } = req.body;
   if (!primaryId || !secondaryIds?.length) return res.status(400).json({ error: 'بيانات ناقصة' });
   if (!DB_ENABLED) return res.json({ ok: true });
@@ -847,7 +1013,7 @@ app.post('/api/orders/merge', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/orders/:id', async (req, res) => {
+app.patch('/api/orders/:id', adminAuth, async (req, res) => {
   const b = req.body;
   if (!DB_ENABLED) {
     const o = memOrders.find(x=>x.id===req.params.id);
@@ -937,7 +1103,7 @@ app.patch('/api/orders/:id', async (req, res) => {
 });
 
 // ===== ORDER HISTORY =====
-app.get('/api/orders/:id/history', async (req, res) => {
+app.get('/api/orders/:id/history', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ history: [] });
   try {
     const orderId = req.params.id;
@@ -999,13 +1165,13 @@ app.get('/api/orders/:id/history', async (req, res) => {
 });
 
 // تسجيل حدث يدوي من الفرونتند
-app.post('/api/orders/:id/history', async (req, res) => {
+app.post('/api/orders/:id/history', adminAuth, async (req, res) => {
   const { action, field, oldValue, newValue, userName } = req.body;
   await logOrderHistory(req.params.id, action, { field, old:oldValue, new:newValue, user:userName||'مستخدم' });
   res.json({ ok: true });
 });
 
-app.delete('/api/orders/:id', async (req, res) => {
+app.delete('/api/orders/:id', adminAuth, async (req, res) => {
   if (!DB_ENABLED) { memOrders = memOrders.filter(o=>o.id!==req.params.id); return res.json({ ok:true }); }
   await pool.query('DELETE FROM orders WHERE id=$1', [req.params.id]);
   res.json({ ok: true });
@@ -1013,7 +1179,7 @@ app.delete('/api/orders/:id', async (req, res) => {
 
 // ===== IMPORT FROM SHOPIFY =====
 
-app.post('/api/import-shopify', async (req, res) => {
+app.post('/api/import-shopify', adminAuth, async (req, res) => {
   const { shopUrl, accessToken, days = 15 } = req.body;
   if (!shopUrl || !accessToken) return res.status(400).json({ error: 'بيانات ناقصة' });
   const since = new Date();
@@ -1113,7 +1279,7 @@ app.post('/api/import-shopify', async (req, res) => {
 });
 
 // ===== COURIERS API =====
-app.get('/api/couriers', async (req, res) => {
+app.get('/api/couriers', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ couriers: memCouriers });
   const { rows } = await pool.query('SELECT * FROM couriers ORDER BY id');
   res.json({ couriers: rows.map(r => ({
@@ -1126,7 +1292,7 @@ app.get('/api/couriers', async (req, res) => {
   })) });
 });
 
-app.post('/api/couriers', async (req, res) => {
+app.post('/api/couriers', adminAuth, async (req, res) => {
   const c = req.body;
   if (!DB_ENABLED) {
     const id = memCouriers.length ? Math.max(...memCouriers.map(x=>x.id))+1 : 1;
@@ -1142,7 +1308,7 @@ app.post('/api/couriers', async (req, res) => {
   res.json({ courier: rows[0] });
 });
 
-app.patch('/api/couriers/:id', async (req, res) => {
+app.patch('/api/couriers/:id', adminAuth, async (req, res) => {
   const b = req.body;
   if (!DB_ENABLED) {
     const c = memCouriers.find(x=>x.id==req.params.id);
@@ -1163,30 +1329,30 @@ app.patch('/api/couriers/:id', async (req, res) => {
   res.json({ courier: rows[0] });
 });
 
-app.delete('/api/couriers/:id', async (req, res) => {
+app.delete('/api/couriers/:id', adminAuth, async (req, res) => {
   if (!DB_ENABLED) { memCouriers = memCouriers.filter(x=>x.id!=req.params.id); return res.json({ ok:true }); }
   await pool.query('DELETE FROM couriers WHERE id=$1', [req.params.id]);
   res.json({ ok: true });
 });
 
 // ===== NOTIFICATIONS =====
-app.get('/api/notifications', async (req, res) => {
+app.get('/api/notifications', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ notifications: memNotifs.slice(0,100) });
   const { rows } = await pool.query('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 100');
   res.json({ notifications: rows });
 });
 
-app.patch('/api/notifications/:id/read', async (req, res) => {
+app.patch('/api/notifications/:id/read', adminAuth, async (req, res) => {
   await pool.query('UPDATE notifications SET read=true WHERE id=$1', [req.params.id]);
   res.json({ ok: true });
 });
 
-app.patch('/api/notifications/read-all', async (req, res) => {
+app.patch('/api/notifications/read-all', adminAuth, async (req, res) => {
   await pool.query('UPDATE notifications SET read=true');
   res.json({ ok: true });
 });
 
-app.post('/api/notifications', async (req, res) => {
+app.post('/api/notifications', adminAuth, async (req, res) => {
   const { icon, title, sub } = req.body;
   if (!DB_ENABLED) {
     const n = {id:Date.now(), icon:icon||'📌', title:title||'', sub:sub||'', read:false, created_at:new Date().toISOString()};
@@ -1235,7 +1401,7 @@ function bostaRequest(env, apiKey, path, method = 'GET', body = null, binary = f
   });
 }
 
-app.post('/api/bosta/test', async (req, res) => {
+app.post('/api/bosta/test', adminAuth, async (req, res) => {
   const { apiKey, env = 'production' } = req.body;
   if (!apiKey) return res.status(400).json({ success: false, error: 'API Key مطلوب' });
   try {
@@ -1253,7 +1419,7 @@ app.post('/api/bosta/test', async (req, res) => {
 
 
 // Bosta AWB PDF
-app.post('/api/bosta/awb', async (req, res) => {
+app.post('/api/bosta/awb', adminAuth, async (req, res) => {
   const { apiKey, env, deliveryId } = req.body;
   if(!apiKey || !deliveryId) return res.json({success:false, error:'Missing params'});
   const baseUrl = env==='staging' 
@@ -1270,7 +1436,7 @@ app.post('/api/bosta/awb', async (req, res) => {
   }
 });
 
-app.post('/api/bosta/create', async (req, res) => {
+app.post('/api/bosta/create', adminAuth, async (req, res) => {
   const { apiKey, env = 'production', locationId, order } = req.body;
   if (!apiKey || !order) return res.status(400).json({ success: false, error: 'بيانات ناقصة' });
   const nameParts = (order.name || '').trim().split(/\s+/);
@@ -1482,7 +1648,7 @@ app.post('/api/bosta/create', async (req, res) => {
 });
 
 // جلب الـ AWB لطلب موجود
-app.get('/api/bosta/awb/:orderId', async (req, res) => {
+app.get('/api/bosta/awb/:orderId', adminAuth, async (req, res) => {
   if (!DB_ENABLED) {
     const o = memOrders.find(x=>x.id===req.params.orderId);
     if (!o) return res.status(404).json({ error: 'الطلب مش موجود' });
@@ -1567,7 +1733,7 @@ async function fetchShopifyOrders(shopUrl, accessToken, sinceDate) {
 // ===== SHOPIFY DIAGNOSE =====
 // جيب line items مع الصور لطلب معين وحدّث الـ DB
 // ===== BACKFILL IMAGES FOR EXISTING ORDERS =====
-app.post('/api/shopify/backfill-images', async (req, res) => {
+app.post('/api/shopify/backfill-images', adminAuth, async (req, res) => {
   const { shopUrl, accessToken, limit = 50 } = req.body;
   if (!shopUrl || !accessToken) return res.status(400).json({ error: 'بيانات ناقصة' });
   if (!DB_ENABLED) return res.json({ done: 0, skipped: 0, error: 'DB not enabled' });
@@ -1611,7 +1777,7 @@ app.post('/api/shopify/backfill-images', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/shopify/fetch-line-items', async (req, res) => {
+app.post('/api/shopify/fetch-line-items', adminAuth, async (req, res) => {
   const { shopUrl, accessToken, shopifyOrderId, orderId } = req.body;
   if (!shopUrl || !accessToken || !shopifyOrderId)
     return res.status(400).json({ error: 'بيانات ناقصة' });
@@ -1637,7 +1803,7 @@ app.post('/api/shopify/fetch-line-items', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/shopify/price-check', async (req, res) => {
+app.post('/api/shopify/price-check', adminAuth, async (req, res) => {
   const { shopUrl, accessToken, shopifyOrderId } = req.body;
   if (!shopUrl || !accessToken || !shopifyOrderId)
     return res.status(400).json({ error: 'بيانات ناقصة' });
@@ -1685,7 +1851,7 @@ app.post('/api/shopify/price-check', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/shopify/diagnose', async (req, res) => {
+app.post('/api/shopify/diagnose', adminAuth, async (req, res) => {
   const { shopUrl, accessToken, shopifyOrderId } = req.body;
   if (!shopUrl || !accessToken || !shopifyOrderId)
     return res.status(400).json({ error: 'بيانات ناقصة' });
@@ -1721,7 +1887,7 @@ app.post('/api/shopify/diagnose', async (req, res) => {
 });
 
 // ===== SHOPIFY ASSIGN: Fulfill + Tag =====
-app.post('/api/shopify/assign', async (req, res) => {
+app.post('/api/shopify/assign', adminAuth, async (req, res) => {
   let { shopUrl, accessToken, shopifyOrderId, courierName, orderId } = req.body;
   let credsSource = 'body';
 
@@ -2229,7 +2395,7 @@ setInterval(cleanupExpiredInvoices, 6 * 60 * 60 * 1000); // كل 6 ساعات
 
 // ===== APP SETTINGS ENDPOINTS =====
 // GET /api/settings → يرجع كل المفاتيح المحفوظة
-app.get('/api/settings', async (req, res) => {
+app.get('/api/settings', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({});
   try {
     const { rows } = await pool.query('SELECT key, value FROM app_settings');
@@ -2249,7 +2415,7 @@ app.get('/api/settings', async (req, res) => {
 function key_is_token(k){ return /token|password|secret|key/i.test(k); }
 
 // GET /api/shopify/test — يختبر إذا كانت الـ credentials شغالة
-app.get('/api/shopify/test', async (req, res) => {
+app.get('/api/shopify/test', adminAuth, async (req, res) => {
   try {
     const creds = await getShopifyCredentials();
     if (!creds.shopUrl || !creds.accessToken) {
@@ -2286,7 +2452,7 @@ app.get('/api/shopify/test', async (req, res) => {
 });
 
 // POST /api/settings → يحفظ مفتاح واحد أو أكتر
-app.post('/api/settings', async (req, res) => {
+app.post('/api/settings', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
   try {
     const body = req.body || {};
@@ -2308,7 +2474,7 @@ app.post('/api/settings', async (req, res) => {
 
 // ===== BATCHES ENDPOINTS =====
 // GET /api/batches → كل الدفعات (أحدث أولاً)
-app.get('/api/batches', async (req, res) => {
+app.get('/api/batches', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json([]);
   try {
     const { rows } = await pool.query(
@@ -2326,7 +2492,7 @@ app.get('/api/batches', async (req, res) => {
 });
 
 // GET /api/batches/current → الدفعة المفتوحة حالياً (آخر واحدة status=open)
-app.get('/api/batches/current', async (req, res) => {
+app.get('/api/batches/current', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json(null);
   try {
     const { rows } = await pool.query(
@@ -2344,7 +2510,7 @@ app.get('/api/batches/current', async (req, res) => {
 });
 
 // POST /api/batches → أنشئ دفعة جديدة
-app.post('/api/batches', async (req, res) => {
+app.post('/api/batches', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
   try {
     const { code, date, status, startedAt } = req.body || {};
@@ -2359,7 +2525,7 @@ app.post('/api/batches', async (req, res) => {
 });
 
 // PATCH /api/batches/:code → حدّث الدفعة (إقفال، تعديل عدد الطلبات)
-app.patch('/api/batches/:code', async (req, res) => {
+app.patch('/api/batches/:code', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
   try {
     const { status, closedAt, orderCount } = req.body || {};
@@ -2379,7 +2545,7 @@ app.patch('/api/batches/:code', async (req, res) => {
 
 // ===== INVOICE CACHE ENDPOINTS =====
 // GET /api/orders/:id/invoice → يرجع الـ HTML جاهز للفاتورة
-app.get('/api/orders/:id/invoice', async (req, res) => {
+app.get('/api/orders/:id/invoice', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.status(503).send('DB unavailable');
   try {
     // جرّب الكاش أولاً
@@ -2408,7 +2574,7 @@ app.get('/api/orders/:id/invoice', async (req, res) => {
 });
 
 // POST /api/orders/:id/invoice/refresh → يعيد توليد الفاتورة يدوياً
-app.post('/api/orders/:id/invoice/refresh', async (req, res) => {
+app.post('/api/orders/:id/invoice/refresh', adminAuth, async (req, res) => {
   try {
     await pool.query('DELETE FROM invoice_cache WHERE order_id=$1', [req.params.id]).catch(()=>{});
     await cacheInvoiceForOrder(req.params.id);
@@ -2417,7 +2583,7 @@ app.post('/api/orders/:id/invoice/refresh', async (req, res) => {
 });
 
 // POST /api/invoices/batch-generate → يولّد عدة فواتير مرة واحدة (بالـ parallel)
-app.post('/api/invoices/batch-generate', async (req, res) => {
+app.post('/api/invoices/batch-generate', adminAuth, async (req, res) => {
   const { orderIds } = req.body;
   if (!Array.isArray(orderIds) || !orderIds.length) return res.status(400).json({ error: 'orderIds مطلوبة' });
 
@@ -2464,7 +2630,7 @@ app.post('/api/invoices/batch-generate', async (req, res) => {
 });
 
 // POST /api/invoices/batch-html → يرجع كل الـ HTML للفواتير في response واحد (أسرع بكتير من 30 fetch)
-app.post('/api/invoices/batch-html', async (req, res) => {
+app.post('/api/invoices/batch-html', adminAuth, async (req, res) => {
   const { orderIds } = req.body;
   if (!Array.isArray(orderIds) || !orderIds.length) return res.status(400).json({ error: 'orderIds مطلوبة' });
   if (orderIds.length > 200) return res.status(400).json({ error: 'max 200 orders per request' });
@@ -2681,7 +2847,7 @@ function shopifyRequest(host, accessToken, path, method = 'GET', body = null) {
 }
 
 // ===== CHECK BOOKS API =====
-app.get('/api/check-books', async (req, res) => {
+app.get('/api/check-books', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ books: [] });
   try {
     // تأكد إن العمودين موجودين قبل الـ SELECT (للـ DBs القديمة)
@@ -2701,7 +2867,7 @@ app.get('/api/check-books', async (req, res) => {
   }
 });
 
-app.post('/api/check-books', async (req, res) => {
+app.post('/api/check-books', adminAuth, async (req, res) => {
   try {
     const { id, name, bank, account, pages, note, firstNum, lastNum } = req.body;
     console.log('📘 POST /api/check-books body:', JSON.stringify(req.body));
@@ -2763,7 +2929,7 @@ app.post('/api/check-books', async (req, res) => {
   }
 });
 
-app.delete('/api/check-books/:id', async (req, res) => {
+app.delete('/api/check-books/:id', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
   try {
     await pool.query('DELETE FROM check_books WHERE id=$1', [req.params.id]);
@@ -2775,7 +2941,7 @@ app.delete('/api/check-books/:id', async (req, res) => {
 });
 
 // ===== VENDORS API =====
-app.get('/api/vendors', async (req, res) => {
+app.get('/api/vendors', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ vendors: [] });
   try {
     const { rows } = await pool.query('SELECT * FROM vendors ORDER BY name ASC');
@@ -2792,7 +2958,7 @@ app.get('/api/vendors', async (req, res) => {
   }
 });
 
-app.post('/api/vendors', async (req, res) => {
+app.post('/api/vendors', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ vendor: req.body });
   try {
     const { id, name, phone, note } = req.body;
@@ -2818,7 +2984,7 @@ app.post('/api/vendors', async (req, res) => {
   }
 });
 
-app.patch('/api/vendors/:id', async (req, res) => {
+app.patch('/api/vendors/:id', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
   try {
     const { name, phone, note } = req.body;
@@ -2842,7 +3008,7 @@ app.patch('/api/vendors/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/vendors/:id', async (req, res) => {
+app.delete('/api/vendors/:id', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
   try {
     // ⚠️ شيك إذا كان فيه شيكات للمورد ده
@@ -2868,7 +3034,7 @@ app.delete('/api/vendors/:id', async (req, res) => {
 });
 
 // ===== CHECKS API =====
-app.get('/api/checks', async (req, res) => {
+app.get('/api/checks', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ checks: [] });
   try {
     const { rows } = await pool.query('SELECT * FROM checks ORDER BY date ASC');
@@ -2885,7 +3051,7 @@ app.get('/api/checks', async (req, res) => {
   }
 });
 
-app.post('/api/checks', async (req, res) => {
+app.post('/api/checks', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ check: req.body });
   try {
     const { id, num, payee, amount, date, bookId, invoice, note, img, status, doneAt } = req.body;
@@ -2903,7 +3069,7 @@ app.post('/api/checks', async (req, res) => {
   }
 });
 
-app.delete('/api/checks/:id', async (req, res) => {
+app.delete('/api/checks/:id', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
   try {
     await pool.query('DELETE FROM checks WHERE id=$1', [req.params.id]);
@@ -2915,7 +3081,7 @@ app.delete('/api/checks/:id', async (req, res) => {
 });
 
 // Sync bulk - يستقبل كل الشيكات والدفاتر مرة واحدة
-app.post('/api/sync-checks', async (req, res) => {
+app.post('/api/sync-checks', adminAuth, async (req, res) => {
   const { books, checks, suppliers } = req.body;
   if (!DB_ENABLED) return res.json({ ok: true });
   try {
@@ -2986,7 +3152,7 @@ app.post('/api/sync-checks', async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v95-2026-04-27-protect-settled';
+const SERVER_VERSION = 'v103-2026-04-28-anti-indexing';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -3015,7 +3181,7 @@ app.get('/', async (req, res) => {
 });
 
 // ===== Diagnostic: list all registered routes =====
-app.get('/api/_routes', (req, res) => {
+app.get('/api/_routes', adminAuth, (req, res) => {
   const routes = [];
   app._router.stack.forEach(layer => {
     if (layer.route) {
@@ -3036,7 +3202,7 @@ app.get('/api/_routes', (req, res) => {
 // ===== SETTLEMENTS API =====
 
 // جيب كل تسويات مندوب
-app.get('/api/settlements/:courierId', async (req, res) => {
+app.get('/api/settlements/:courierId', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({settlements:[]});
   try{
     const r = await pool.query(
@@ -3058,7 +3224,7 @@ app.get('/api/settlements/:courierId', async (req, res) => {
 });
 
 // جيب كل التسويات
-app.get('/api/settlements', async (req, res) => {
+app.get('/api/settlements', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({settlements:[]});
   try{
     const r = await pool.query('SELECT * FROM settlements ORDER BY ts DESC LIMIT 500');
@@ -3077,8 +3243,8 @@ app.get('/api/settlements', async (req, res) => {
 });
 
 // إضافة تسوية جديدة
-app.post('/api/settlements', async (req, res) => {
-  const {courierId, ts, orderIds, cod, ship, notes, adj} = req.body;
+app.post('/api/settlements', adminAuth, async (req, res) => {
+  const {courierId, ts, orderIds, cod, ship, notes, adj, adjustmentIds} = req.body;
   if(!courierId) return res.status(400).json({error:'courierId required'});
   if(!DB_ENABLED) return res.json({success:true, id:Date.now()});
   try{
@@ -3089,6 +3255,8 @@ app.post('/api/settlements', async (req, res) => {
        JSON.stringify(orderIds||[]),
        cod||0, ship||0, notes||'', JSON.stringify(adj||[])]
     );
+    const settlementId = r.rows[0].id;
+
     // حدّث settled في couriers
     await pool.query(
       'UPDATE couriers SET settled=true WHERE id=$1',
@@ -3107,10 +3275,39 @@ app.post('/api/settlements', async (req, res) => {
          RETURNING id`,
         [orderIds]
       );
-      console.log(`✅ Settlement ${r.rows[0].id}: updated ${updateResult.rows.length}/${orderIds.length} orders to مسوّى`);
+      console.log(`✅ Settlement ${settlementId}: updated ${updateResult.rows.length}/${orderIds.length} orders to مسوّى`);
     }
 
-    res.json({success:true, id:r.rows[0].id});
+    // 🆕 v96: اربط الـ approved adjustments بهذه التسوية عشان مايظهروش في تسوية تانية
+    // فيه طريقتين: lo الـ frontend بعت adjustmentIds استخدمهم، وإلا اربط كل الـ approved للمندوب
+    try{
+      let linkResult;
+      if(Array.isArray(adjustmentIds) && adjustmentIds.length){
+        linkResult = await pool.query(
+          `UPDATE courier_adjustments
+           SET settlement_id=$1
+           WHERE id = ANY($2) AND courier_id=$3 AND status='approved' AND settlement_id IS NULL
+           RETURNING id`,
+          [settlementId, adjustmentIds, courierId]
+        );
+      } else {
+        // fallback: اربط كل الـ approved adjustments للمندوب اللي مش متربطين
+        linkResult = await pool.query(
+          `UPDATE courier_adjustments
+           SET settlement_id=$1
+           WHERE courier_id=$2 AND status='approved' AND settlement_id IS NULL
+           RETURNING id`,
+          [settlementId, courierId]
+        );
+      }
+      if(linkResult.rows.length){
+        console.log(`🔗 Settlement ${settlementId}: linked ${linkResult.rows.length} approved adjustments`);
+      }
+    }catch(linkErr){
+      console.warn('⚠️ Failed to link adjustments to settlement:', linkErr.message);
+    }
+
+    res.json({success:true, id:settlementId});
   }catch(e){
     console.error('❌ POST /api/settlements error:', e.message);
     res.status(500).json({error:e.message});
@@ -3120,7 +3317,7 @@ app.post('/api/settlements', async (req, res) => {
 // 🆕 v90: endpoint لإصلاح طلبات اتسوّت لكن status لسه "جاري التوصيل"
 // يستخدم لمرة واحدة لتنظيف البيانات الحالية
 // 🆕 v91: diagnostic endpoint — يشيك على طلب معين ايه حالته ولماذا
-app.get('/api/admin/diagnose-order/:orderId', async (req, res) => {
+app.get('/api/admin/diagnose-order/:orderId', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
   const orderId = req.params.orderId;
   try{
@@ -3171,7 +3368,7 @@ app.get('/api/admin/diagnose-order/:orderId', async (req, res) => {
 });
 
 // 🆕 v91: fix endpoint محسّن — يستخدم LIKE بدل jsonb (الـ jsonb بيفشل لو فيه أي escape characters)
-app.post('/api/admin/fix-settled-orders-v2', async (req, res) => {
+app.post('/api/admin/fix-settled-orders-v2', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
   try{
     // الخطوة 1: جيب كل الـ settlements
@@ -3218,7 +3415,7 @@ app.post('/api/admin/fix-settled-orders-v2', async (req, res) => {
   }
 });
 
-app.post('/api/admin/fix-settled-orders', async (req, res) => {
+app.post('/api/admin/fix-settled-orders', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
   try{
     // كل الطلبات اللي موجودة في settlements لكن status لسه "جاري التوصيل"
@@ -3243,7 +3440,7 @@ app.post('/api/admin/fix-settled-orders', async (req, res) => {
 });
 
 // حذف تسوية (للتراجع)
-app.delete('/api/settlements/:id', async (req, res) => {
+app.delete('/api/settlements/:id', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({success:true});
   try{
     await pool.query('DELETE FROM settlements WHERE id=$1', [req.params.id]);
@@ -3384,19 +3581,20 @@ app.post('/webhook/shopify/cancel', async (req, res) => {
 });
 
 // ===== USERS API =====
-app.get('/api/users', async (req, res) => {
+app.get('/api/users', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({users:[]});
   try{
-    const r = await pool.query('SELECT username,name,pass_hash,pages,active FROM users ORDER BY created_at');
+    // 🆕 v102: ما نرجعش pass_hash للأمان
+    const r = await pool.query('SELECT username,name,pages,active,created_at FROM users ORDER BY created_at');
     res.json({users: r.rows.map(u=>({
       username: u.username, name: u.name,
-      passHash: u.pass_hash,
-      pages: JSON.parse(u.pages||'[]'), active: u.active
+      pages: JSON.parse(u.pages||'[]'), active: u.active,
+      createdAt: u.created_at,
     }))});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-app.post('/api/users', async (req, res) => {
+app.post('/api/users', adminAuth, async (req, res) => {
   const {username, name, passHash, pages, active=true} = req.body;
   if(!username||!name||!passHash) return res.status(400).json({error:'Missing fields'});
   if(!DB_ENABLED) return res.json({success:true});
@@ -3410,7 +3608,7 @@ app.post('/api/users', async (req, res) => {
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-app.delete('/api/users/:username', async (req, res) => {
+app.delete('/api/users/:username', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({success:true});
   try{
     await pool.query('DELETE FROM users WHERE username=$1', [req.params.username]);
@@ -3429,11 +3627,50 @@ app.post('/api/login', async (req, res) => {
     );
     if(r.rows.length){
       const u = r.rows[0];
-      res.json({found:true, user:{username:u.username, name:u.name, pages:JSON.parse(u.pages||'[]'), role:'custom', active:true}});
+      // 🆕 v102: أنشئ session token
+      const token = _generateToken();
+      const expires = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 يوم
+      _adminSessions.set(token, {
+        username: u.username,
+        name: u.name,
+        pages: JSON.parse(u.pages||'[]'),
+        expires,
+      });
+      try{
+        const ip = req.headers['x-forwarded-for'] || req.connection?.remoteAddress || '';
+        const ua = req.headers['user-agent'] || '';
+        await pool.query(
+          `INSERT INTO admin_sessions (token, username, expires_at, ip, user_agent)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (token) DO NOTHING`,
+          [token, u.username, new Date(expires), ip.toString().slice(0, 100), ua.slice(0, 200)]
+        );
+      }catch(e){ console.warn('Failed to persist admin session:', e.message); }
+
+      res.json({
+        found: true,
+        token,
+        user: { username: u.username, name: u.name, pages: JSON.parse(u.pages||'[]'), role: 'custom', active: true }
+      });
     } else {
       res.json({found:false});
     }
   }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// 🆕 v102: GET /api/admin/me — تحقق من الـ token
+app.get('/api/admin/me', adminAuth, async (req, res) => {
+  res.json({ user: req.adminUser });
+});
+
+// 🆕 v102: POST /api/admin/logout — مسح الـ session
+app.post('/api/admin/logout', adminAuth, async (req, res) => {
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  _adminSessions.delete(token);
+  if(DB_ENABLED){
+    pool.query('DELETE FROM admin_sessions WHERE token=$1', [token]).catch(()=>{});
+  }
+  res.json({success: true});
 });
 
 // ============================================================
@@ -3443,6 +3680,8 @@ app.post('/api/login', async (req, res) => {
 // Simple courier session tokens (in-memory, 24h TTL)
 const _courierSessions = new Map(); // token -> {courierId, expires} — cache only
 const _shopSessions = new Map(); // token -> {shopUserId, username, expires} — cache only
+// 🆕 v102: Admin sessions
+const _adminSessions = new Map(); // token -> {username, name, pages, expires}
 
 function _generateToken(){
   return crypto.randomBytes(32).toString('hex');
@@ -3471,6 +3710,18 @@ async function _ensureSessionsTable(){
       )
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_shop_sessions_expires ON shop_sessions(expires_at)`);
+    // 🆕 v102: Admin sessions table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_sessions (
+        token TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        ip TEXT,
+        user_agent TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at)`);
     console.log('✅ Sessions tables ready');
   }catch(e){
     console.warn('⚠️ Sessions table init failed:', e.message);
@@ -3534,6 +3785,56 @@ async function _loadShopSessionFromDB(token){
 }
 
 // Middleware: validates courier token
+// 🆕 v102: Admin authentication middleware
+async function _loadAdminSessionFromDB(token){
+  if(!DB_ENABLED) return null;
+  try{
+    const r = await pool.query(
+      `SELECT s.username, s.expires_at, u.name, u.pages, u.active
+       FROM admin_sessions s
+       LEFT JOIN users u ON u.username = s.username
+       WHERE s.token=$1 AND s.expires_at > NOW()`,
+      [token]
+    );
+    if(!r.rows.length) return null;
+    if(!r.rows[0].active) return null; // user deactivated
+    const session = {
+      username: r.rows[0].username,
+      name: r.rows[0].name || r.rows[0].username,
+      pages: JSON.parse(r.rows[0].pages || '[]'),
+      expires: new Date(r.rows[0].expires_at).getTime(),
+    };
+    _adminSessions.set(token, session);
+    return session;
+  }catch(e){ return null; }
+}
+
+async function adminAuth(req, res, next){
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if(!token) return res.status(401).json({error: 'No admin token'});
+
+  let session = _adminSessions.get(token);
+  if(!session){
+    session = await _loadAdminSessionFromDB(token);
+  }
+  if(!session) return res.status(401).json({error: 'Invalid or expired admin token'});
+
+  if(session.expires < Date.now()){
+    _adminSessions.delete(token);
+    if(DB_ENABLED){
+      pool.query('DELETE FROM admin_sessions WHERE token=$1', [token]).catch(()=>{});
+    }
+    return res.status(401).json({error: 'Admin session expired'});
+  }
+
+  req.adminUser = {
+    username: session.username,
+    name: session.name,
+    pages: session.pages,
+  };
+  next();
+}
+
 async function courierAuth(req, res, next){
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
   if(!token) return res.status(401).json({error: 'No token'});
@@ -3621,6 +3922,237 @@ app.get('/api/courier/me', courierAuth, async (req, res) => {
     res.json(c);
   }catch(e){ res.status(500).json({error: e.message}); }
 });
+
+// 🆕 v97: GET /api/courier/dashboard — إحصائيات شاملة للمندوب
+app.get('/api/courier/dashboard', courierAuth, async (req, res) => {
+  if (!DB_ENABLED) return res.json({});
+  try{
+    const data = await _computeCourierDashboard(req.courierId);
+    res.json(data);
+  }catch(e){
+    console.error('dashboard error:', e.message, e.stack);
+    res.status(500).json({error: e.message});
+  }
+});
+
+// 🆕 v98: GET /api/admin/courier-dashboard/:courierId — للأدمن في OrderPro
+// يديله نفس الـ dashboard data لأي مندوب
+app.get('/api/admin/courier-dashboard/:courierId', adminAuth, async (req, res) => {
+  if (!DB_ENABLED) return res.json({});
+  try{
+    const cId = parseInt(req.params.courierId);
+    if (!cId) return res.status(400).json({error: 'invalid courier id'});
+    const data = await _computeCourierDashboard(cId);
+    // أضف معلومات المندوب للـ response
+    const cR = await pool.query('SELECT id, name, phone, zone FROM couriers WHERE id=$1', [cId]);
+    data.courier = cR.rows[0] || null;
+    res.json(data);
+  }catch(e){
+    console.error('admin courier-dashboard error:', e.message, e.stack);
+    res.status(500).json({error: e.message});
+  }
+});
+
+// 🆕 v98: helper — يحسب الـ dashboard data لمندوب معين
+async function _computeCourierDashboard(courierId){
+  // 1) كل الطلبات اللي اتسلمت في فترات مختلفة (مع courier_delivered_at OR settled_at)
+  const baseQ = `
+    WITH delivered AS (
+      SELECT
+        o.id, o.total, o.ship, o.area, o.assigned_zone, o.paid, o.status,
+        COALESCE(o.courier_delivered_at, o.settled_at, o.updated_at) AS done_at,
+        COALESCE(o.picked_up_at, o.updated_at) AS picked_at,
+        o.created_at,
+        EXTRACT(EPOCH FROM (COALESCE(o.courier_delivered_at, o.settled_at) - o.created_at))/3600 AS hours_total
+      FROM orders o
+      WHERE o.courier_id = $1
+        AND o.status IN ('مكتمل', 'مسوّى', 'تم التسليم')
+        AND (o.merged_into IS NULL OR o.merged_into = '')
+    )
+    SELECT * FROM delivered
+  `;
+  const allDel = await pool.query(baseQ, [courierId]);
+  const orders = allDel.rows;
+
+  // helper: filter orders بفترة
+  const inRange = (days) => {
+    const now = Date.now();
+    const since = now - days * 24 * 60 * 60 * 1000;
+    return orders.filter(o => o.done_at && new Date(o.done_at).getTime() >= since);
+  };
+
+  const inMonth = (offsetMonths) => {
+    const now = new Date();
+    const target = new Date(now.getFullYear(), now.getMonth() - offsetMonths, 1);
+    const next = new Date(target.getFullYear(), target.getMonth() + 1, 1);
+    return orders.filter(o => {
+      if (!o.done_at) return false;
+      const t = new Date(o.done_at);
+      return t >= target && t < next;
+    });
+  };
+
+  const sumShip = (arr) => arr.reduce((s,o) => s + (parseFloat(o.ship) || 0), 0);
+  const sumCod = (arr) => arr.reduce((s,o) => s + (o.paid ? 0 : (parseFloat(o.total) || 0)), 0);
+
+  const last7 = inRange(7);
+  const last30 = inRange(30);
+  const lastMonth = inMonth(1);
+  const thisMonth = inMonth(0);
+
+  const avgDaily = last30.length / 30;
+
+  const validHours = last30.filter(o => o.hours_total != null && o.hours_total >= 0 && o.hours_total < 24*7);
+  const avgHours = validHours.length
+    ? validHours.reduce((s, o) => s + parseFloat(o.hours_total), 0) / validHours.length
+    : 0;
+
+  const totalLifetime = orders.length;
+  const totalEarnings = sumShip(orders);
+
+  const allAssignedQ = await pool.query(
+    `SELECT COUNT(*) FILTER (WHERE status IN ('مكتمل', 'مسوّى', 'تم التسليم')) as done,
+            COUNT(*) FILTER (WHERE status IN ('مرتجع', 'ملغي بالميدان')) as failed,
+            COUNT(*) AS total
+     FROM orders
+     WHERE courier_id = $1
+       AND (merged_into IS NULL OR merged_into = '')
+       AND status NOT IN ('في الانتظار', 'جديد', 'جاري التوصيل')`,
+    [courierId]
+  );
+  const a = allAssignedQ.rows[0];
+  const successRate = (parseInt(a.total) > 0)
+    ? (parseInt(a.done) / parseInt(a.total)) * 100
+    : 0;
+  const returnRate = (parseInt(a.total) > 0)
+    ? (parseInt(a.failed) / parseInt(a.total)) * 100
+    : 0;
+
+  const dayMap = {};
+  orders.forEach(o => {
+    if (!o.done_at) return;
+    const d = new Date(o.done_at).toISOString().slice(0, 10);
+    dayMap[d] = (dayMap[d] || 0) + 1;
+  });
+  let peakDay = null, peakCount = 0;
+  for (const [d, c] of Object.entries(dayMap)) {
+    if (c > peakCount) { peakCount = c; peakDay = d; }
+  }
+
+  let streak = 0;
+  let cursor = new Date();
+  for (let i = 0; i < 365; i++) {
+    const dStr = cursor.toISOString().slice(0, 10);
+    if (dayMap[dStr]) {
+      streak++;
+    } else if (i === 0) {
+      // النهاردة لو فاضي، نشوف امبارح
+    } else {
+      break;
+    }
+    cursor.setDate(cursor.getDate() - 1);
+  }
+
+  const zoneMap = {};
+  last30.forEach(o => {
+    const z = o.assigned_zone || o.area || 'غير محدد';
+    zoneMap[z] = (zoneMap[z] || 0) + 1;
+  });
+  const topZones = Object.entries(zoneMap)
+    .sort((a,b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([zone, count]) => ({ zone, count }));
+
+  const dailyChart = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const dStr = d.toISOString().slice(0, 10);
+    dailyChart.push({
+      date: dStr,
+      count: dayMap[dStr] || 0,
+    });
+  }
+
+  const rankQ = await pool.query(
+    `WITH stats AS (
+       SELECT courier_id, COUNT(*) AS cnt
+       FROM orders
+       WHERE status IN ('مكتمل', 'مسوّى', 'تم التسليم')
+         AND COALESCE(courier_delivered_at, settled_at, updated_at) >= NOW() - INTERVAL '30 days'
+         AND (merged_into IS NULL OR merged_into = '')
+         AND courier_id IS NOT NULL
+       GROUP BY courier_id
+     )
+     SELECT
+       (SELECT COUNT(*) FROM stats WHERE cnt > (SELECT cnt FROM stats WHERE courier_id=$1)) AS rank,
+       (SELECT COUNT(*) FROM stats) AS total,
+       (SELECT cnt FROM stats WHERE courier_id=$1) AS my_count,
+       (SELECT AVG(cnt) FROM stats) AS avg_count`,
+    [courierId]
+  );
+  const ranking = rankQ.rows[0] || {};
+  const myRank = parseInt(ranking.rank) + 1;
+  const totalCouriers = parseInt(ranking.total) || 1;
+  const myCount = parseInt(ranking.my_count) || 0;
+  const avgCount = parseFloat(ranking.avg_count) || 0;
+  const percentile = totalCouriers > 0
+    ? Math.round(((totalCouriers - myRank + 1) / totalCouriers) * 100)
+    : 0;
+
+  const achievements = [];
+  const milestones = [10, 50, 100, 250, 500, 1000, 2500, 5000];
+  milestones.forEach(m => {
+    if (totalLifetime >= m) achievements.push({
+      icon: m >= 1000 ? '🏆' : m >= 250 ? '🥇' : m >= 50 ? '🥈' : '🥉',
+      label: `${m}+ طلب`,
+      unlocked: true,
+    });
+  });
+  const next = milestones.find(m => m > totalLifetime);
+  if (next) achievements.push({
+    icon: '🔒',
+    label: `${next} طلب`,
+    unlocked: false,
+    progress: Math.round((totalLifetime / next) * 100),
+    remaining: next - totalLifetime,
+  });
+
+  const monthChange = lastMonth.length > 0
+    ? Math.round(((thisMonth.length - lastMonth.length) / lastMonth.length) * 100)
+    : (thisMonth.length > 0 ? 100 : 0);
+
+  return {
+    last7: { count: last7.length, earnings: sumShip(last7), cod: sumCod(last7) },
+    last30: { count: last30.length, earnings: sumShip(last30), cod: sumCod(last30) },
+    lastMonth: { count: lastMonth.length, earnings: sumShip(lastMonth), cod: sumCod(lastMonth) },
+    thisMonth: { count: thisMonth.length, earnings: sumShip(thisMonth), cod: sumCod(thisMonth) },
+    lifetime: { count: totalLifetime, earnings: totalEarnings },
+
+    avgDailyOrders: parseFloat(avgDaily.toFixed(1)),
+    avgDeliveryHours: parseFloat(avgHours.toFixed(1)),
+    successRate: parseFloat(successRate.toFixed(1)),
+    returnRate: parseFloat(returnRate.toFixed(1)),
+
+    peakDay,
+    peakCount,
+    streak,
+
+    topZones,
+    dailyChart,
+
+    ranking: {
+      rank: myRank,
+      total: totalCouriers,
+      myCount,
+      avgCount: parseFloat(avgCount.toFixed(1)),
+      percentile,
+    },
+
+    achievements,
+    monthChange,
+  };
+}
 
 // GET /api/courier/my-orders — كل طلبات المندوب مقسمة حسب الحالة
 app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
@@ -3752,6 +4284,47 @@ app.post('/api/courier/orders/:id/deliver', courierAuth, async (req, res) => {
       `INSERT INTO order_history (order_id, action, user_name, new_value)
        VALUES ($1, 'courier_delivered', $2, 'delivered')`,
       [id, 'Courier #' + req.courierId]
+    ).catch(()=>{});
+
+    res.json({success: true});
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// 🆕 v101: POST /api/courier/orders/:id/undo-deliver — رجّع الطلب من "تحت التسوية" لـ "جاري التوصيل"
+// المندوب لو سلّم بالغلط
+app.post('/api/courier/orders/:id/undo-deliver', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  try{
+    const chk = await pool.query('SELECT courier_id, status, settled_at FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(String(o.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+    // لو الطلب اتسوّى بالفعل، ما ينفعش يرجع
+    if(o.settled_at || o.status === 'مسوّى'){
+      return res.status(400).json({error: 'الطلب اتسوّى بالفعل — مينفعش رجوع'});
+    }
+    // لازم يكون الطلب في "تحت التسوية" أو "مكتمل"
+    if(!['تحت التسوية', 'مكتمل', 'تم التسليم'].includes(o.status)){
+      return res.status(400).json({error: 'الطلب مش في حالة تسمح بالرجوع'});
+    }
+
+    // رجّع لـ "جاري التوصيل"
+    await pool.query(
+      `UPDATE orders SET
+        status='جاري التوصيل',
+        courier_delivered_at=NULL,
+        updated_at=NOW()
+       WHERE id=$1`,
+      [id]
+    );
+
+    // log
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, field, old_value, new_value, user_name)
+       VALUES ($1, 'تراجع عن التسليم', 'status', $2, 'جاري التوصيل', $3)`,
+      [id, o.status, 'مندوب #' + req.courierId]
     ).catch(()=>{});
 
     res.json({success: true});
@@ -4196,7 +4769,7 @@ app.get('/api/courier/my-statement', courierAuth, async (req, res) => {
 // ====== ADMIN/ACCOUNTANT ENDPOINTS ======
 
 // POST /api/orders/bulk-pickup — تسجيل استلام عدة طلبات من المحل دفعة واحدة
-app.post('/api/orders/bulk-pickup', async (req, res) => {
+app.post('/api/orders/bulk-pickup', adminAuth, async (req, res) => {
   const { orderIds } = req.body;
   if (!Array.isArray(orderIds) || !orderIds.length) {
     return res.status(400).json({ error: 'orderIds مطلوبة' });
@@ -4232,7 +4805,7 @@ app.post('/api/orders/bulk-pickup', async (req, res) => {
 // POST /api/couriers/:id/mark-picked-up
 // لما المحاسب يطبع ورقة توصيل، بنعلم الطلبات إنها اتسلمت للمندوب
 // body: {orderIds: string[]}
-app.post('/api/couriers/:id/mark-picked-up', async (req, res) => {
+app.post('/api/couriers/:id/mark-picked-up', adminAuth, async (req, res) => {
   const {orderIds} = req.body || {};
   if(!Array.isArray(orderIds) || !orderIds.length){
     return res.status(400).json({error: 'orderIds مطلوبة'});
@@ -4249,7 +4822,7 @@ app.post('/api/couriers/:id/mark-picked-up', async (req, res) => {
 
 // POST /api/couriers/:id/set-credentials — الأدمن يحدد username/password للمندوب
 // body: {username, passHash}
-app.post('/api/couriers/:id/set-credentials', async (req, res) => {
+app.post('/api/couriers/:id/set-credentials', adminAuth, async (req, res) => {
   const {username, passHash} = req.body || {};
   if(!username || !passHash) return res.status(400).json({error: 'username و password مطلوبين'});
   try{
@@ -4271,7 +4844,7 @@ app.post('/api/couriers/:id/set-credentials', async (req, res) => {
 });
 
 // GET /api/pending-reviews — المراجعات المعلقة (للمحاسب)
-app.get('/api/pending-reviews', async (req, res) => {
+app.get('/api/pending-reviews', adminAuth, async (req, res) => {
   try{
     const r = await pool.query(
       `SELECT pr.id, pr.order_id, pr.courier_id, pr.type, pr.data, pr.status,
@@ -4300,7 +4873,7 @@ app.get('/api/pending-reviews', async (req, res) => {
 });
 
 // POST /api/pending-reviews/:id/approve
-app.post('/api/pending-reviews/:id/approve', async (req, res) => {
+app.post('/api/pending-reviews/:id/approve', adminAuth, async (req, res) => {
   const {reviewedBy} = req.body || {};
   try{
     const r = await pool.query(
@@ -4344,7 +4917,7 @@ app.post('/api/pending-reviews/:id/approve', async (req, res) => {
 });
 
 // POST /api/pending-reviews/:id/reject
-app.post('/api/pending-reviews/:id/reject', async (req, res) => {
+app.post('/api/pending-reviews/:id/reject', adminAuth, async (req, res) => {
   const {reviewedBy, reason} = req.body || {};
   try{
     const r = await pool.query(
@@ -4385,7 +4958,7 @@ app.post('/api/pending-reviews/:id/reject', async (req, res) => {
 });
 
 // GET /api/pending-reviews/:id/proof — جيب صورة الدليل
-app.get('/api/pending-reviews/:id/proof', async (req, res) => {
+app.get('/api/pending-reviews/:id/proof', adminAuth, async (req, res) => {
   try{
     const r = await pool.query(
       'SELECT data FROM pending_reviews WHERE id=$1',
@@ -4401,7 +4974,7 @@ app.get('/api/pending-reviews/:id/proof', async (req, res) => {
 });
 
 // GET /api/courier-adjustments/pending — تسويات المناديب المعلقة (للمحاسب)
-app.get('/api/courier-adjustments/pending', async (req, res) => {
+app.get('/api/courier-adjustments/pending', adminAuth, async (req, res) => {
   try{
     const r = await pool.query(
       `SELECT ca.id, ca.courier_id, ca.amount, ca.reason, ca.status, ca.created_at,
@@ -4425,8 +4998,245 @@ app.get('/api/courier-adjustments/pending', async (req, res) => {
   }catch(e){ res.status(500).json({error: e.message}); }
 });
 
+// 🆕 v96: GET /api/courier-adjustments/approved-unsettled/:courierId
+// التعديلات المعتمدة اللي لسه ما اتربطتش بأي تسوية (للمحاسب وقت إنشاء تسوية)
+app.get('/api/courier-adjustments/approved-unsettled/:courierId', adminAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.json([]);
+  try{
+    const r = await pool.query(
+      `SELECT id, amount, reason, status, created_at, reviewed_at,
+              CASE WHEN proof_image_base64 IS NOT NULL THEN true ELSE false END as has_proof
+       FROM courier_adjustments
+       WHERE courier_id=$1 AND status='approved' AND settlement_id IS NULL
+       ORDER BY created_at ASC`,
+      [req.params.courierId]
+    );
+    res.json(r.rows.map(a => ({
+      id: a.id,
+      amount: parseFloat(a.amount),
+      reason: a.reason,
+      status: a.status,
+      hasProof: a.has_proof,
+      createdAt: a.created_at,
+      reviewedAt: a.reviewed_at
+    })));
+  }catch(e){
+    console.error('approved-unsettled error:', e.message);
+    res.status(500).json({error: e.message});
+  }
+});
+
+// 🆕 v101: SHIPPING TRANSFER REQUESTS
+
+// POST /api/shipping-transfers — مندوب يطلب تحويل طلب
+app.post('/api/shipping-transfers', courierAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
+  const { orderId, targetType, targetCourierId, reason } = req.body || {};
+  if(!orderId || !targetType) return res.status(400).json({error:'orderId و targetType مطلوبين'});
+  if(!['courier', 'bosta'].includes(targetType)) return res.status(400).json({error:'targetType لازم يكون courier أو bosta'});
+  if(targetType === 'courier' && !targetCourierId) return res.status(400).json({error:'targetCourierId مطلوب لو target=courier'});
+
+  try{
+    // تأكد إن الطلب فعلاً مع المندوب ده
+    const orderR = await pool.query(
+      `SELECT id, courier_id, status FROM orders WHERE id=$1`,
+      [orderId]
+    );
+    if(!orderR.rows.length) return res.status(404).json({error:'الطلب غير موجود'});
+    const order = orderR.rows[0];
+    if(String(order.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error:'الطلب ده مش معك'});
+    }
+    if(['مكتمل', 'مسوّى', 'تم التسليم', 'ملغي'].includes(order.status)){
+      return res.status(400).json({error:'مينفعش تطلب تحويل لطلب بالحالة دي'});
+    }
+
+    // تأكد إنه مفيش طلب pending موجود نفسه
+    const existR = await pool.query(
+      `SELECT id FROM shipping_transfer_requests WHERE order_id=$1 AND status='pending'`,
+      [orderId]
+    );
+    if(existR.rows.length){
+      return res.status(400).json({error:'فيه طلب تحويل معلق على نفس الأوردر بالفعل'});
+    }
+
+    const r = await pool.query(
+      `INSERT INTO shipping_transfer_requests (order_id, from_courier_id, target_type, target_courier_id, reason, status)
+       VALUES ($1, $2, $3, $4, $5, 'pending')
+       RETURNING id, created_at`,
+      [orderId, req.courierId, targetType, targetType === 'courier' ? targetCourierId : null, reason || null]
+    );
+
+    // سجل event في تاريخ الطلب
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, field, old_value, new_value, user_name)
+       VALUES ($1, 'طلب تحويل شحن', 'transfer_request', $2, $3, $4)`,
+      [orderId, '', `طلب تحويل: ${targetType === 'bosta' ? 'بوسطة' : 'مندوب آخر'}${reason ? ' — '+reason : ''}`, 'مندوب #'+req.courierId]
+    ).catch(() => {});
+
+    res.json({ success: true, id: r.rows[0].id, createdAt: r.rows[0].created_at });
+  }catch(e){
+    console.error('POST shipping-transfers error:', e.message);
+    res.status(500).json({error: e.message});
+  }
+});
+
+// GET /api/shipping-transfers?status=pending — للأدمن
+app.get('/api/shipping-transfers', adminAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.json([]);
+  try{
+    const status = req.query.status || 'pending';
+    const r = await pool.query(
+      `SELECT
+         t.id, t.order_id, t.from_courier_id, t.target_type, t.target_courier_id,
+         t.reason, t.status, t.reviewed_by, t.reviewed_at, t.rejection_reason, t.created_at,
+         fc.name AS from_courier_name, fc.phone AS from_courier_phone,
+         tc.name AS target_courier_name,
+         o.name AS customer_name, o.phone AS customer_phone, o.area, o.addr, o.total, o.paid, o.status AS order_status
+       FROM shipping_transfer_requests t
+       LEFT JOIN couriers fc ON fc.id = t.from_courier_id
+       LEFT JOIN couriers tc ON tc.id = t.target_courier_id
+       LEFT JOIN orders o ON o.id = t.order_id
+       WHERE t.status = $1
+       ORDER BY t.created_at DESC`,
+      [status]
+    );
+    res.json(r.rows.map(x => ({
+      id: x.id,
+      orderId: x.order_id,
+      fromCourierId: x.from_courier_id,
+      fromCourierName: x.from_courier_name,
+      fromCourierPhone: x.from_courier_phone,
+      targetType: x.target_type,
+      targetCourierId: x.target_courier_id,
+      targetCourierName: x.target_courier_name,
+      reason: x.reason,
+      status: x.status,
+      reviewedBy: x.reviewed_by,
+      reviewedAt: x.reviewed_at,
+      rejectionReason: x.rejection_reason,
+      createdAt: x.created_at,
+      customer: {
+        name: x.customer_name,
+        phone: x.customer_phone,
+        area: x.area,
+        addr: x.addr,
+        total: parseFloat(x.total) || 0,
+        paid: x.paid,
+        orderStatus: x.order_status,
+      }
+    })));
+  }catch(e){
+    console.error('GET shipping-transfers error:', e.message);
+    res.status(500).json({error: e.message});
+  }
+});
+
+// POST /api/shipping-transfers/:id/approve
+app.post('/api/shipping-transfers/:id/approve', adminAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
+  const { reviewedBy } = req.body || {};
+  try{
+    // جيب الطلب
+    const tR = await pool.query(
+      `SELECT * FROM shipping_transfer_requests WHERE id=$1 AND status='pending'`,
+      [req.params.id]
+    );
+    if(!tR.rows.length) return res.status(404).json({error:'طلب غير موجود أو معتمد بالفعل'});
+    const t = tR.rows[0];
+
+    // حدّث الطلب
+    if(t.target_type === 'bosta'){
+      // حول لبوسطة: شيل courier_id واعمل isBosta=true
+      await pool.query(
+        `UPDATE orders SET courier_id=NULL, is_bosta=true, status='جديد', updated_at=NOW() WHERE id=$1`,
+        [t.order_id]
+      );
+      await pool.query(
+        `INSERT INTO order_history (order_id, action, field, old_value, new_value, user_name)
+         VALUES ($1, 'تحويل لبوسطة', 'courier', $2, 'بوسطة', $3)`,
+        [t.order_id, 'مندوب #'+t.from_courier_id, reviewedBy || 'admin']
+      ).catch(() => {});
+    } else {
+      // حول لمندوب تاني
+      await pool.query(
+        `UPDATE orders SET courier_id=$1, is_bosta=false, status='جديد', picked_up_at=NULL, updated_at=NOW() WHERE id=$2`,
+        [t.target_courier_id, t.order_id]
+      );
+      await pool.query(
+        `INSERT INTO order_history (order_id, action, field, old_value, new_value, user_name)
+         VALUES ($1, 'تحويل لمندوب', 'courier', $2, $3, $4)`,
+        [t.order_id, 'مندوب #'+t.from_courier_id, 'مندوب #'+t.target_courier_id, reviewedBy || 'admin']
+      ).catch(() => {});
+    }
+
+    // اعتمد الـ request
+    await pool.query(
+      `UPDATE shipping_transfer_requests SET status='approved', reviewed_by=$1, reviewed_at=NOW() WHERE id=$2`,
+      [reviewedBy || 'admin', req.params.id]
+    );
+
+    res.json({ success: true });
+  }catch(e){
+    console.error('approve transfer error:', e.message);
+    res.status(500).json({error: e.message});
+  }
+});
+
+// POST /api/shipping-transfers/:id/reject
+app.post('/api/shipping-transfers/:id/reject', adminAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
+  const { reviewedBy, reason } = req.body || {};
+  try{
+    const r = await pool.query(
+      `UPDATE shipping_transfer_requests
+       SET status='rejected', reviewed_by=$1, reviewed_at=NOW(), rejection_reason=$2
+       WHERE id=$3 AND status='pending'
+       RETURNING order_id`,
+      [reviewedBy || 'admin', reason || '', req.params.id]
+    );
+    if(!r.rows.length) return res.status(404).json({error:'طلب غير موجود أو معتمد بالفعل'});
+
+    // سجل event
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, field, old_value, new_value, user_name)
+       VALUES ($1, 'رفض تحويل شحن', 'transfer_request', '', $2, $3)`,
+      [r.rows[0].order_id, reason || '(بدون سبب)', reviewedBy || 'admin']
+    ).catch(() => {});
+
+    res.json({ success: true });
+  }catch(e){
+    console.error('reject transfer error:', e.message);
+    res.status(500).json({error: e.message});
+  }
+});
+
+// 🆕 v101: GET /api/courier/my-transfer-requests — للمندوب يشوف طلبات التحويل بتاعته
+app.get('/api/courier/my-transfer-requests', courierAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.json([]);
+  try{
+    const r = await pool.query(
+      `SELECT id, order_id, target_type, status, reason, rejection_reason, created_at, reviewed_at
+       FROM shipping_transfer_requests
+       WHERE from_courier_id=$1
+       ORDER BY created_at DESC LIMIT 100`,
+      [req.courierId]
+    );
+    res.json(r.rows.map(x => ({
+      id: x.id,
+      orderId: x.order_id,
+      targetType: x.target_type,
+      status: x.status,
+      reason: x.reason,
+      rejectionReason: x.rejection_reason,
+      createdAt: x.created_at,
+      reviewedAt: x.reviewed_at,
+    })));
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
 // POST /api/courier-adjustments/:id/approve
-app.post('/api/courier-adjustments/:id/approve', async (req, res) => {
+app.post('/api/courier-adjustments/:id/approve', adminAuth, async (req, res) => {
   const {reviewedBy} = req.body || {};
   try{
     try {
@@ -4451,7 +5261,7 @@ app.post('/api/courier-adjustments/:id/approve', async (req, res) => {
 });
 
 // POST /api/courier-adjustments/:id/reject
-app.post('/api/courier-adjustments/:id/reject', async (req, res) => {
+app.post('/api/courier-adjustments/:id/reject', adminAuth, async (req, res) => {
   const {reviewedBy, reason} = req.body || {};
   try{
     try {
@@ -4476,7 +5286,7 @@ app.post('/api/courier-adjustments/:id/reject', async (req, res) => {
 });
 
 // GET /api/courier-adjustments/:id/proof
-app.get('/api/courier-adjustments/:id/proof', async (req, res) => {
+app.get('/api/courier-adjustments/:id/proof', adminAuth, async (req, res) => {
   try{
     const r = await pool.query(
       'SELECT proof_image_base64 FROM courier_adjustments WHERE id=$1',
@@ -4900,7 +5710,7 @@ app.post('/api/shop/orders/:id/transfer-to-shipping', shopAuth, async (req, res)
 // ===== ADMIN: shipping transfers management =====
 
 // GET /api/shipping-transfers — قائمة التحويلات (filter by status)
-app.get('/api/shipping-transfers', async (req, res) => {
+app.get('/api/shipping-transfers', adminAuth, async (req, res) => {
   const status = req.query.status || 'pending';
   try{
     const r = await pool.query(
@@ -4945,7 +5755,7 @@ app.get('/api/shipping-transfers', async (req, res) => {
 
 // POST /api/shipping-transfers/:id/accept-and-assign
 // body: {shippingCost, target: 'bosta' | 'courier:<id>', acceptedBy}
-app.post('/api/shipping-transfers/:id/accept-and-assign', async (req, res) => {
+app.post('/api/shipping-transfers/:id/accept-and-assign', adminAuth, async (req, res) => {
   const {shippingCost, target, acceptedBy} = req.body || {};
   if(shippingCost == null || isNaN(parseFloat(shippingCost))){
     return res.status(400).json({error: 'سعر الشحن مطلوب'});
@@ -5029,7 +5839,7 @@ app.post('/api/shipping-transfers/:id/accept-and-assign', async (req, res) => {
 });
 
 // POST /api/shipping-transfers/:id/reject — رفض التحويل (الطلب يرجع pickup عادي)
-app.post('/api/shipping-transfers/:id/reject', async (req, res) => {
+app.post('/api/shipping-transfers/:id/reject', adminAuth, async (req, res) => {
   const {reason, rejectedBy} = req.body || {};
   try{
     const trR = await pool.query(
@@ -5060,7 +5870,7 @@ app.post('/api/shipping-transfers/:id/reject', async (req, res) => {
 });
 
 // POST /api/shop-users — admin creates shop user
-app.post('/api/shop-users', async (req, res) => {
+app.post('/api/shop-users', adminAuth, async (req, res) => {
   const {username, passHash, displayName} = req.body || {};
   if(!username || !passHash) return res.status(400).json({error: 'username و password مطلوبين'});
   try{
@@ -5076,7 +5886,7 @@ app.post('/api/shop-users', async (req, res) => {
 });
 
 // GET /api/shop-users — list
-app.get('/api/shop-users', async (req, res) => {
+app.get('/api/shop-users', adminAuth, async (req, res) => {
   try{
     const r = await pool.query(
       'SELECT id, username, display_name, active, last_login_at, created_at FROM shop_users ORDER BY created_at DESC'
@@ -5088,7 +5898,7 @@ app.get('/api/shop-users', async (req, res) => {
 // ===== Field Cancellations (إلغاءات بانتظار استلام الإدارة) =====
 
 // GET /api/field-cancellations — list all pending cancellations
-app.get('/api/field-cancellations', async (req, res) => {
+app.get('/api/field-cancellations', adminAuth, async (req, res) => {
   try{
     const r = await pool.query(
       `SELECT o.id, o.name, o.phone, o.area, o.addr, o.addr2, o.total, o.paid,
@@ -5124,7 +5934,7 @@ app.get('/api/field-cancellations', async (req, res) => {
 // POST /api/field-cancellations/:orderId/confirm-receive
 // الإدارة أكدت إنها استلمت الطلب من المندوب/المحل
 // body: {receivedBy: string}
-app.post('/api/field-cancellations/:orderId/confirm-receive', async (req, res) => {
+app.post('/api/field-cancellations/:orderId/confirm-receive', adminAuth, async (req, res) => {
   const {orderId} = req.params;
   const {receivedBy} = req.body || {};
   try{
@@ -5163,7 +5973,7 @@ app.post('/api/field-cancellations/:orderId/confirm-receive', async (req, res) =
 
 // POST /api/field-cancellations/:orderId/revert
 // الإدارة قررت ترجع الطلب (الإلغاء كان بالغلط)
-app.post('/api/field-cancellations/:orderId/revert', async (req, res) => {
+app.post('/api/field-cancellations/:orderId/revert', adminAuth, async (req, res) => {
   const {orderId} = req.params;
   const {revertedBy} = req.body || {};
   try{
@@ -5233,7 +6043,7 @@ async function initTreasuryTables(client) {
 }
 
 // GET all treasuries
-app.get('/api/treasuries', async (req, res) => {
+app.get('/api/treasuries', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({treasuries:[]});
   try {
     const client = await pool.connect();
@@ -5245,7 +6055,7 @@ app.get('/api/treasuries', async (req, res) => {
 });
 
 // POST treasury
-app.post('/api/treasuries', async (req, res) => {
+app.post('/api/treasuries', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({ok:true});
   const {id, name, opening, note} = req.body;
   try {
@@ -5261,7 +6071,7 @@ app.post('/api/treasuries', async (req, res) => {
 });
 
 // DELETE treasury
-app.delete('/api/treasuries/:id', async (req, res) => {
+app.delete('/api/treasuries/:id', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({ok:true});
   try {
     const client = await pool.connect();
@@ -5273,7 +6083,7 @@ app.delete('/api/treasuries/:id', async (req, res) => {
 });
 
 // GET transactions
-app.get('/api/treasury-tx', async (req, res) => {
+app.get('/api/treasury-tx', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({transactions:[]});
   try {
     const client = await pool.connect();
@@ -5288,7 +6098,7 @@ app.get('/api/treasury-tx', async (req, res) => {
 });
 
 // POST transaction
-app.post('/api/treasury-tx', async (req, res) => {
+app.post('/api/treasury-tx', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({ok:true});
   const {id, treasuryId, type, amount, reason, date} = req.body;
   try {
@@ -5304,7 +6114,7 @@ app.post('/api/treasury-tx', async (req, res) => {
 });
 
 // DELETE transaction
-app.delete('/api/treasury-tx/:id', async (req, res) => {
+app.delete('/api/treasury-tx/:id', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({ok:true});
   try {
     const client = await pool.connect();
@@ -5315,7 +6125,7 @@ app.delete('/api/treasury-tx/:id', async (req, res) => {
 });
 
 // PATCH transaction (edit)
-app.patch('/api/treasury-tx/:id', async (req, res) => {
+app.patch('/api/treasury-tx/:id', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({ok:true});
   const {amount, reason, date, type} = req.body;
   try {
@@ -5329,7 +6139,7 @@ app.patch('/api/treasury-tx/:id', async (req, res) => {
   } catch(e) { res.json({ok:false}); }
 });
 // Check Suppliers
-app.get('/api/check-suppliers', async (req, res) => {
+app.get('/api/check-suppliers', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({suppliers:[]});
   try{
     await pool.query("CREATE TABLE IF NOT EXISTS check_suppliers (id TEXT PRIMARY KEY, name TEXT)");
@@ -5338,7 +6148,7 @@ app.get('/api/check-suppliers', async (req, res) => {
   }catch(e){ res.json({suppliers:[]}); }
 });
 
-app.post('/api/check-suppliers', async (req, res) => {
+app.post('/api/check-suppliers', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({ok:true});
   const {id, name} = req.body;
   try{
@@ -5348,7 +6158,7 @@ app.post('/api/check-suppliers', async (req, res) => {
   }catch(e){ res.json({ok:false}); }
 });
 
-app.delete('/api/check-suppliers/:id', async (req, res) => {
+app.delete('/api/check-suppliers/:id', adminAuth, async (req, res) => {
   if(!DB_ENABLED) return res.json({ok:true});
   try{
     await pool.query('DELETE FROM check_suppliers WHERE id=$1', [req.params.id]);
@@ -5358,7 +6168,7 @@ app.delete('/api/check-suppliers/:id', async (req, res) => {
 
 // ===== BARCODE VERIFICATION SYSTEM =====
 
-app.post('/api/preparation/start', async (req, res) => {
+app.post('/api/preparation/start', courierAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
   const { orderId, preparerId } = req.body;
   if (!orderId || !preparerId) return res.status(400).json({ error: 'orderId and preparerId required' });
@@ -5407,7 +6217,7 @@ app.post('/api/preparation/start', async (req, res) => {
   }
 });
 
-app.post('/api/preparation/scan', async (req, res) => {
+app.post('/api/preparation/scan', courierAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true, matched: true });
   const { orderId, barcode, preparerId } = req.body;
   if (!orderId || !barcode) return res.status(400).json({ error: 'orderId and barcode required' });
@@ -5482,7 +6292,7 @@ app.post('/api/preparation/scan', async (req, res) => {
   }
 });
 
-app.post('/api/preparation/complete', async (req, res) => {
+app.post('/api/preparation/complete', courierAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
   const { orderId, preparerId, preparerName } = req.body;
   if (!orderId || !preparerId) return res.status(400).json({ error: 'orderId and preparerId required' });
@@ -5560,7 +6370,7 @@ app.post('/api/preparation/complete', async (req, res) => {
   }
 });
 
-app.get('/api/preparation/orders', async (req, res) => {
+app.get('/api/preparation/orders', courierAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ orders: [] });
   const preparerId = parseInt(req.query.preparerId, 10);
   if (!preparerId || isNaN(preparerId)) {
@@ -5612,7 +6422,7 @@ app.get('/api/preparation/orders', async (req, res) => {
 });
 
 // /api/preparation/find/:id — للـ QR scan: يدور على الطلب أينما كان ويرجع رسالة واضحة
-app.get('/api/preparation/find/:id', async (req, res) => {
+app.get('/api/preparation/find/:id', courierAuth, async (req, res) => {
   if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
   const orderId = String(req.params.id || '').trim();
   const preparerId = parseInt(req.query.preparerId, 10);
@@ -5679,7 +6489,7 @@ app.get('/api/preparation/find/:id', async (req, res) => {
 });
 
 // /api/preparation/manual-mark — تأكيد يدوي لمنتج بدون باركود
-app.post('/api/preparation/manual-mark', async (req, res) => {
+app.post('/api/preparation/manual-mark', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
   const { orderId, itemKey, quantity, preparerId } = req.body;
   if (!orderId || !itemKey) return res.status(400).json({ error: 'orderId and itemKey required' });
@@ -5704,7 +6514,7 @@ app.post('/api/preparation/manual-mark', async (req, res) => {
 });
 
 // /api/preparation/order/:id/barcodes — يرجع الباركودات المتاحة في الطلب (للـ debug)
-app.get('/api/preparation/order/:id/barcodes', async (req, res) => {
+app.get('/api/preparation/order/:id/barcodes', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
   try {
     const r = await pool.query('SELECT id, items, line_items_json FROM orders WHERE id=$1', [req.params.id]);
@@ -5733,7 +6543,7 @@ app.get('/api/preparation/order/:id/barcodes', async (req, res) => {
 // 🆕 v70: Backfill endpoint — يحمل صور للطلبات اللي معندهاش imageBase64
 // POST /api/admin/backfill-images
 // body: { limit: 50, dryRun: false, retryFailed: true } — يشغّل على دفعات
-app.post('/api/admin/backfill-images', async (req, res) => {
+app.post('/api/admin/backfill-images', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
   const limit = Math.min(parseInt(req.body.limit) || 20, 50);
   const dryRun = req.body.dryRun === true;
@@ -5822,7 +6632,7 @@ app.post('/api/admin/backfill-images', async (req, res) => {
 });
 
 // GET /api/admin/backfill-images/status — كم طلب لسه محتاج enrich
-app.get('/api/admin/backfill-images/status', async (req, res) => {
+app.get('/api/admin/backfill-images/status', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
   try {
     const r = await pool.query(
@@ -5894,7 +6704,7 @@ function canSettle(order) {
   return { valid: false, error: 'بيانات التسليم غير مكتملة' };
 }
 
-app.get('/api/orders/:id/state-info', async (req, res) => {
+app.get('/api/orders/:id/state-info', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ error: 'Database not enabled' });
   try {
     const { id } = req.params;
@@ -5921,7 +6731,7 @@ app.get('/api/orders/:id/state-info', async (req, res) => {
   }
 });
 
-app.post('/api/orders/:id/fix-state', async (req, res) => {
+app.post('/api/orders/:id/fix-state', adminAuth, async (req, res) => {
   if (!DB_ENABLED) return res.json({ ok: true });
   try {
     const { id } = req.params;
