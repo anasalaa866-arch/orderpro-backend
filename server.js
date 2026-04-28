@@ -3152,7 +3152,7 @@ app.post('/api/sync-checks', adminAuth, async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v104-2026-04-28-admin-fix';
+const SERVER_VERSION = 'v105-2026-04-28-admin-role';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -3647,10 +3647,12 @@ app.post('/api/login', async (req, res) => {
         );
       }catch(e){ console.warn('Failed to persist admin session:', e.message); }
 
+      // 🔧 v105: لو username='admin'، خليه role='admin' عشان الـ frontend يديله صلاحيات كاملة
+      const role = (u.username === 'admin') ? 'admin' : 'custom';
       res.json({
         found: true,
         token,
-        user: { username: u.username, name: u.name, pages: JSON.parse(u.pages||'[]'), role: 'custom', active: true }
+        user: { username: u.username, name: u.name, pages: JSON.parse(u.pages||'[]'), role, active: true }
       });
     } else {
       res.json({found:false});
