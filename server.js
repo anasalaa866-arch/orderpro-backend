@@ -3152,7 +3152,7 @@ app.post('/api/sync-checks', adminAuth, async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v103-2026-04-28-anti-indexing';
+const SERVER_VERSION = 'v104-2026-04-28-admin-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -3728,6 +3728,27 @@ async function _ensureSessionsTable(){
   }
 }
 _ensureSessionsTable();
+
+// 🆕 v104: تأكد إن admin user موجود في DB عشان يقدر ياخد token
+async function _ensureAdminUser(){
+  if(!DB_ENABLED) return;
+  try{
+    // hash لـ password ثابتة معروفة في الـ frontend (ADMIN_USER.passHash)
+    const ADMIN_HASH = 'b6623210b82535beb2fe64e288d05a937d29da5d73522814631ca811de9f0ba5';
+    const r = await pool.query(
+      `INSERT INTO users (username, name, pass_hash, pages, active)
+       VALUES ('admin', 'المدير', $1, '[]', true)
+       ON CONFLICT (username) DO UPDATE
+         SET pass_hash = EXCLUDED.pass_hash, active = true
+         WHERE users.pass_hash IS NULL OR users.pass_hash = ''`,
+      [ADMIN_HASH]
+    );
+    console.log('✅ Admin user verified/created');
+  }catch(e){
+    console.warn('⚠️ Admin user init failed:', e.message);
+  }
+}
+_ensureAdminUser();
 
 async function _cleanupExpiredSessions(){
   const now = Date.now();
