@@ -4522,6 +4522,8 @@ function _mapOrderForCourier(r){
     customerNote: r.customer_note || '',
     courierNote: r.courier_note || '',
     items: r.items,
+    // 🆕 v108: lineItemsJson فيه التفاصيل الكاملة للمنتجات (للتسليم الجزئي)
+    lineItemsJson: r.line_items_json || null,
     pickedUpAt: r.picked_up_at,
     deliveredAt: r.courier_delivered_at,
     deliverySequence: r.delivery_sequence,
