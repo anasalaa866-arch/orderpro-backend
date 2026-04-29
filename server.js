@@ -2282,7 +2282,22 @@ async function _getCustomerRisk(phone, forceRefresh = false){
         );
       }catch(e){}
     }
-    return { phone: normalized, totalOrders: 0, riskPercentage: 0, notFound: true };
+    // 🆕 v107: ارجع كل الـ fields بقيم 0 عشان الـ frontend ميعرضش undefined
+    return { 
+      phone: normalized, 
+      customerId: null,
+      customerName: '',
+      totalOrders: 0, 
+      cancelledOrders: 0,
+      refundedOrders: 0,
+      successfulOrders: 0,
+      totalSpent: 0,
+      riskPercentage: 0, 
+      lastOrderAt: null,
+      firstOrderAt: null,
+      tags: '',
+      notFound: true 
+    };
   }
 
   const orders = await _fetchShopifyCustomerOrders(creds.shopUrl, creds.accessToken, customer.id);
@@ -3390,7 +3405,7 @@ app.post('/api/sync-checks', adminAuth, async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v106-2026-04-28-customer-risk';
+const SERVER_VERSION = 'v108-2026-04-29-partial-delivery-and-proof-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -4471,7 +4486,17 @@ app.get('/api/courier/my-orders', courierAuth, async (req, res) => {
     cancelledR.rows.forEach(row => { delete row.bosta_awb_base64; });
     const cancelled = cancelledR.rows.map(o => _mapOrderForCourier(o));
 
-    res.json({withMe, newOrders, completed, cancelled});
+    // 🆕 v108: جيب قائمة المناديب الآخرين (للـ transfer requests)
+    let couriers = [];
+    try{
+      const cR = await pool.query(
+        `SELECT id, name, zone FROM couriers WHERE id != $1 ORDER BY name`,
+        [req.courierId]
+      );
+      couriers = cR.rows;
+    }catch(e){ /* silent — fallback لو في schema مختلف */ }
+
+    res.json({withMe, newOrders, completed, cancelled, couriers});
   }catch(e){ console.error('my-orders:', e); res.status(500).json({error: e.message}); }
 });
 
@@ -4551,8 +4576,141 @@ app.post('/api/courier/orders/:id/deliver', courierAuth, async (req, res) => {
   }catch(e){ res.status(500).json({error: e.message}); }
 });
 
-// 🆕 v101: POST /api/courier/orders/:id/undo-deliver — رجّع الطلب من "تحت التسوية" لـ "جاري التوصيل"
-// المندوب لو سلّم بالغلط
+// 🆕 v108: POST /api/courier/orders/:id/partial-deliver — تسليم جزئي
+// body: {
+//   deliveredItems: [{name, quantity, price}],  // المنتجات اللي اتسلمت
+//   returnedItems: [{name, quantity, price}],   // المنتجات اللي رجعت
+//   collectedAmount: number,                     // المبلغ المُحصَّل
+//   returnReason: string                         // سبب الإرجاع (اختياري)
+// }
+// النتيجة:
+//   - الطلب الأصلي يتعدّل: items=delivered, total=collectedAmount, status='تحت التسوية'
+//   - يتعمل طلب جديد بـ id جديد للمنتجات المُرجعة بحالة 'ملغي' + cancelled_by_field=true
+app.post('/api/courier/orders/:id/partial-deliver', courierAuth, async (req, res) => {
+  const {id} = req.params;
+  const { deliveredItems, returnedItems, collectedAmount, returnReason } = req.body || {};
+  
+  // التحقق من صحة البيانات
+  if(!Array.isArray(deliveredItems) || deliveredItems.length === 0){
+    return res.status(400).json({error: 'لازم تختار منتج واحد على الأقل اتسلم'});
+  }
+  if(!Array.isArray(returnedItems) || returnedItems.length === 0){
+    return res.status(400).json({error: 'لازم يكون في منتج واحد على الأقل مرتجع (لو الكل اتسلم استخدم تم التسليم العادي)'});
+  }
+  if(typeof collectedAmount !== 'number' || collectedAmount < 0){
+    return res.status(400).json({error: 'المبلغ المُحصَّل غير صحيح'});
+  }
+  
+  try{
+    // تحقق إن الطلب فعلاً للمندوب ده
+    const chk = await pool.query('SELECT * FROM orders WHERE id=$1', [id]);
+    if(!chk.rows.length) return res.status(404).json({error: 'الطلب غير موجود'});
+    const o = chk.rows[0];
+    if(String(o.courier_id) !== String(req.courierId)){
+      return res.status(403).json({error: 'الطلب ده مش ليك'});
+    }
+    if(o.status !== 'جاري التوصيل'){
+      return res.status(400).json({error: 'الطلب لا يمكن تسليمه في حالته الحالية'});
+    }
+    
+    // 1️⃣ تعديل الطلب الأصلي: المنتجات المُسلَّمة + المبلغ المُحصَّل + status='تحت التسوية'
+    const deliveredItemsJson = JSON.stringify(deliveredItems);
+    await pool.query(
+      `UPDATE orders SET
+        status='تحت التسوية',
+        courier_delivered_at=NOW(),
+        items=$2,
+        total=$3,
+        order_note=COALESCE(order_note, '') || $4,
+        updated_at=NOW()
+       WHERE id=$1`,
+      [
+        id, 
+        deliveredItemsJson, 
+        collectedAmount,
+        `\n[تسليم جزئي] تم تسليم جزء من الطلب — راجع الطلب رقم ${id}-R للجزء المُرجَع`
+      ]
+    );
+    
+    // 2️⃣ إنشاء طلب جديد للمنتجات المُرجَعة (بحالة ملغي + cancelled_by_field)
+    const returnedId = `${id}-R`;
+    const returnedItemsJson = JSON.stringify(returnedItems);
+    const returnedTotal = returnedItems.reduce((sum, item) => {
+      return sum + (parseFloat(item.price || 0) * parseInt(item.quantity || 1));
+    }, 0);
+    
+    // تأكد إن الـ id مش موجود بالفعل
+    const existR = await pool.query('SELECT id FROM orders WHERE id=$1', [returnedId]);
+    if(existR.rows.length){
+      // لو موجود، نستخدم timestamp
+      const altId = `${id}-R-${Date.now().toString(36).slice(-4)}`;
+      await pool.query(
+        `INSERT INTO orders (
+          id, src, name, phone, area, addr, total, ship, courier_id, 
+          status, paid, items, note, order_note, 
+          cancelled_by_field, cancelled_at, cancellation_reason,
+          created_at, updated_at
+        ) VALUES (
+          $1, 'partial_return', $2, $3, $4, $5, $6, 0, $7,
+          'ملغي', false, $8, $9, $10,
+          true, NOW(), $11,
+          NOW(), NOW()
+        )`,
+        [
+          altId, o.name, o.phone, o.area, o.addr, returnedTotal, req.courierId,
+          returnedItemsJson,
+          `إرجاع جزئي من الطلب الأصلي #${id}`,
+          `[إرجاع جزئي] منتجات لم يستلمها العميل من الطلب #${id}`,
+          returnReason || 'تسليم جزئي - العميل لم يستلم كل المنتجات'
+        ]
+      );
+    } else {
+      await pool.query(
+        `INSERT INTO orders (
+          id, src, name, phone, area, addr, total, ship, courier_id, 
+          status, paid, items, note, order_note,
+          cancelled_by_field, cancelled_at, cancellation_reason,
+          created_at, updated_at
+        ) VALUES (
+          $1, 'partial_return', $2, $3, $4, $5, $6, 0, $7,
+          'ملغي', false, $8, $9, $10,
+          true, NOW(), $11,
+          NOW(), NOW()
+        )`,
+        [
+          returnedId, o.name, o.phone, o.area, o.addr, returnedTotal, req.courierId,
+          returnedItemsJson,
+          `إرجاع جزئي من الطلب الأصلي #${id}`,
+          `[إرجاع جزئي] منتجات لم يستلمها العميل من الطلب #${id}`,
+          returnReason || 'تسليم جزئي - العميل لم يستلم كل المنتجات'
+        ]
+      );
+    }
+    
+    // 3️⃣ سجل في order_history
+    await pool.query(
+      `INSERT INTO order_history (order_id, action, user_name, new_value)
+       VALUES ($1, 'partial_delivery', $2, $3)`,
+      [
+        id, 
+        'Courier #' + req.courierId,
+        `تسليم جزئي: حُصِّل ${collectedAmount} ج، رجّع ${returnedItems.length} منتج`
+      ]
+    ).catch(()=>{});
+    
+    res.json({
+      success: true,
+      orderId: id,
+      returnedOrderId: returnedId,
+      collectedAmount,
+      deliveredItemsCount: deliveredItems.length,
+      returnedItemsCount: returnedItems.length
+    });
+  }catch(e){ 
+    console.error('partial-deliver error:', e.message);
+    res.status(500).json({error: e.message}); 
+  }
+});
 app.post('/api/courier/orders/:id/undo-deliver', courierAuth, async (req, res) => {
   const {id} = req.params;
   try{
@@ -5219,6 +5377,8 @@ app.post('/api/pending-reviews/:id/reject', adminAuth, async (req, res) => {
 });
 
 // GET /api/pending-reviews/:id/proof — جيب صورة الدليل
+// 🆕 v108: ترجع الصورة كـ binary (image/jpeg أو image/png) بدل HTML
+// ده عشان نقدر نستخدمها مع fetch + blob من الـ frontend (مع authentication)
 app.get('/api/pending-reviews/:id/proof', adminAuth, async (req, res) => {
   try{
     const r = await pool.query(
@@ -5229,9 +5389,26 @@ app.get('/api/pending-reviews/:id/proof', adminAuth, async (req, res) => {
     const data = r.rows[0].data || {};
     if(!data.proofImageBase64) return res.status(404).send('No proof');
 
-    // الـ base64 يبدأ بـ data:image/... — ابعث HTML بسيط يعرض الصورة
-    res.send(`<!DOCTYPE html><html><head><title>Proof</title><style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style></head><body><img src="${data.proofImageBase64}"></body></html>`);
-  }catch(e){ res.status(500).send(e.message); }
+    // استخرج الـ MIME type والـ base64 data من الـ data URI
+    // format: "data:image/jpeg;base64,/9j/4AAQ..."
+    const dataUri = data.proofImageBase64;
+    const matches = dataUri.match(/^data:([^;]+);base64,(.+)$/);
+    if(!matches){
+      return res.status(500).send('Invalid image format');
+    }
+    
+    const mimeType = matches[1] || 'image/jpeg';
+    const base64Data = matches[2];
+    const buffer = Buffer.from(base64Data, 'base64');
+    
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', buffer.length);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.send(buffer);
+  }catch(e){ 
+    console.error('proof error:', e.message);
+    res.status(500).send(e.message); 
+  }
 });
 
 // GET /api/courier-adjustments/pending — تسويات المناديب المعلقة (للمحاسب)
@@ -5673,6 +5850,7 @@ app.post('/api/courier-adjustments/:id/reject', adminAuth, async (req, res) => {
 });
 
 // GET /api/courier-adjustments/:id/proof
+// 🆕 v108: ترجع الصورة كـ binary (image/jpeg أو image/png) بدل HTML
 app.get('/api/courier-adjustments/:id/proof', adminAuth, async (req, res) => {
   try{
     const r = await pool.query(
@@ -5682,8 +5860,26 @@ app.get('/api/courier-adjustments/:id/proof', adminAuth, async (req, res) => {
     if(!r.rows.length || !r.rows[0].proof_image_base64){
       return res.status(404).send('Not found');
     }
-    res.send(`<!DOCTYPE html><html><head><title>Proof</title><style>body{margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh}img{max-width:100%;max-height:100vh}</style></head><body><img src="${r.rows[0].proof_image_base64}"></body></html>`);
-  }catch(e){ res.status(500).send(e.message); }
+    
+    // استخرج الـ MIME type والـ base64 data من الـ data URI
+    const dataUri = r.rows[0].proof_image_base64;
+    const matches = dataUri.match(/^data:([^;]+);base64,(.+)$/);
+    if(!matches){
+      return res.status(500).send('Invalid image format');
+    }
+    
+    const mimeType = matches[1] || 'image/jpeg';
+    const base64Data = matches[2];
+    const buffer = Buffer.from(base64Data, 'base64');
+    
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', buffer.length);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.send(buffer);
+  }catch(e){ 
+    console.error('adjustment proof error:', e.message);
+    res.status(500).send(e.message); 
+  }
 });
 
 // ============================================================
