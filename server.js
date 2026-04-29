@@ -291,6 +291,34 @@ async function initDB() {
       "CREATE INDEX IF NOT EXISTS idx_str_status ON shipping_transfer_requests(status)",
       "CREATE INDEX IF NOT EXISTS idx_str_order ON shipping_transfer_requests(order_id)",
 
+      // 🆕 v106: cache لتقييم مخاطر العملاء من Shopify
+      `CREATE TABLE IF NOT EXISTS customer_risk_cache (
+        phone TEXT PRIMARY KEY,
+        shopify_customer_id TEXT,
+        customer_name TEXT,
+        total_orders INTEGER DEFAULT 0,
+        cancelled_orders INTEGER DEFAULT 0,
+        refunded_orders INTEGER DEFAULT 0,
+        successful_orders INTEGER DEFAULT 0,
+        total_spent NUMERIC DEFAULT 0,
+        risk_percentage NUMERIC DEFAULT 0,
+        last_order_at TIMESTAMPTZ,
+        first_order_at TIMESTAMPTZ,
+        tags TEXT,
+        notes TEXT,
+        cached_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
+      "CREATE INDEX IF NOT EXISTS idx_crc_risk ON customer_risk_cache(risk_percentage DESC)",
+      "CREATE INDEX IF NOT EXISTS idx_crc_cached ON customer_risk_cache(cached_at)",
+
+      // 🆕 v106: إعدادات تقييم المخاطر (key/value)
+      `CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`,
+
       // صلاحية محاسبة المناديب (للمستخدمين)
       "ALTER TABLE users ADD COLUMN IF NOT EXISTS can_settle_couriers BOOLEAN DEFAULT false",
 
@@ -2084,6 +2112,216 @@ async function getShopifyCredentials() {
   };
 }
 
+// 🆕 v106: نـورمالايز الـ phone عشان البحث في Shopify
+function _normalizePhone(phone){
+  if(!phone) return '';
+  let p = String(phone).replace(/[^\d+]/g, '');
+  // شيل أكواد الدولة المصرية المختلفة → خليه يبدأ بـ 0
+  if(p.startsWith('+20')) p = '0' + p.slice(3);
+  else if(p.startsWith('0020')) p = '0' + p.slice(4);
+  else if(p.startsWith('20') && p.length === 12) p = '0' + p.slice(2);
+  // تأكد إنه يبدأ بـ 0
+  if(!p.startsWith('0') && p.length === 10) p = '0' + p;
+  return p;
+}
+
+// 🆕 v106: ابحث عن عميل في Shopify بالتليفون
+async function _searchShopifyCustomerByPhone(shopUrl, accessToken, phone){
+  const normalized = _normalizePhone(phone);
+  if(!normalized || normalized.length < 10) return null;
+
+  // جرّب البحث بـ variants مختلفة من التليفون
+  const variants = [
+    normalized,
+    normalized.startsWith('0') ? '+2' + normalized : normalized,  // +20...
+    normalized.startsWith('0') ? '2' + normalized : normalized,    // 20...
+    normalized.startsWith('0') ? normalized.slice(1) : normalized, // بدون الـ 0
+  ];
+
+  for(const variant of variants){
+    try{
+      const url = `https://${shopUrl}/admin/api/2024-01/customers/search.json?query=phone:${encodeURIComponent(variant)}`;
+      const r = await httpsRequest(url, {
+        method: 'GET',
+        headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' }
+      });
+      if(r.statusCode === 200 && r.body){
+        const data = JSON.parse(r.body);
+        if(data.customers && data.customers.length > 0){
+          return data.customers[0];
+        }
+      }
+    }catch(e){
+      console.warn('Shopify customer search error:', e.message);
+    }
+  }
+  return null;
+}
+
+// 🆕 v106: جيب طلبات عميل من Shopify
+async function _fetchShopifyCustomerOrders(shopUrl, accessToken, customerId){
+  try{
+    const url = `https://${shopUrl}/admin/api/2024-01/customers/${customerId}/orders.json?status=any&limit=250`;
+    const r = await httpsRequest(url, {
+      method: 'GET',
+      headers: { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' }
+    });
+    if(r.statusCode === 200 && r.body){
+      const data = JSON.parse(r.body);
+      return data.orders || [];
+    }
+  }catch(e){
+    console.warn('Shopify customer orders error:', e.message);
+  }
+  return [];
+}
+
+// 🆕 v106: حسب نسبة المخاطر للعميل من Shopify orders
+function _computeCustomerRisk(customer, orders){
+  if(!orders || orders.length === 0){
+    return {
+      totalOrders: 0,
+      cancelledOrders: 0,
+      refundedOrders: 0,
+      successfulOrders: 0,
+      riskPercentage: 0,
+      totalSpent: 0,
+      lastOrderAt: null,
+      firstOrderAt: null,
+    };
+  }
+
+  let cancelled = 0, refunded = 0, successful = 0, totalSpent = 0;
+  let firstOrder = null, lastOrder = null;
+
+  for(const o of orders){
+    // طلب ملغي
+    if(o.cancelled_at){
+      cancelled++;
+    }
+    // طلب مرتجع (refund or restocked)
+    else if(o.financial_status === 'refunded' || o.financial_status === 'voided' || o.fulfillment_status === 'restocked'){
+      refunded++;
+    }
+    // طلب ناجح (مكتمل ومدفوع)
+    else if(o.fulfillment_status === 'fulfilled' && o.financial_status === 'paid'){
+      successful++;
+      totalSpent += parseFloat(o.total_price || 0);
+    }
+    // طلب pending — مش بنحسبه في النسبة
+
+    const t = new Date(o.created_at).getTime();
+    if(!firstOrder || t < firstOrder) firstOrder = t;
+    if(!lastOrder || t > lastOrder) lastOrder = t;
+  }
+
+  const evaluated = cancelled + refunded + successful;
+  const failed = cancelled + refunded;
+  const riskPct = evaluated > 0 ? Math.round((failed / evaluated) * 100) : 0;
+
+  return {
+    totalOrders: orders.length,
+    cancelledOrders: cancelled,
+    refundedOrders: refunded,
+    successfulOrders: successful,
+    riskPercentage: riskPct,
+    totalSpent: Math.round(totalSpent),
+    lastOrderAt: lastOrder ? new Date(lastOrder).toISOString() : null,
+    firstOrderAt: firstOrder ? new Date(firstOrder).toISOString() : null,
+  };
+}
+
+// 🆕 v106: جيب أو احسب تقييم العميل (مع caching)
+async function _getCustomerRisk(phone, forceRefresh = false){
+  const normalized = _normalizePhone(phone);
+  if(!normalized) return null;
+
+  // تحقق من الـ cache (TTL: 24 ساعة)
+  if(DB_ENABLED && !forceRefresh){
+    try{
+      const r = await pool.query(
+        `SELECT * FROM customer_risk_cache WHERE phone=$1 AND cached_at > NOW() - INTERVAL '24 hours'`,
+        [normalized]
+      );
+      if(r.rows.length){
+        const c = r.rows[0];
+        return {
+          phone: c.phone,
+          customerId: c.shopify_customer_id,
+          customerName: c.customer_name,
+          totalOrders: c.total_orders,
+          cancelledOrders: c.cancelled_orders,
+          refundedOrders: c.refunded_orders,
+          successfulOrders: c.successful_orders,
+          totalSpent: parseFloat(c.total_spent) || 0,
+          riskPercentage: parseFloat(c.risk_percentage) || 0,
+          lastOrderAt: c.last_order_at,
+          firstOrderAt: c.first_order_at,
+          tags: c.tags,
+          cached: true,
+          cachedAt: c.cached_at,
+        };
+      }
+    }catch(e){ console.warn('cache read error:', e.message); }
+  }
+
+  // جيب من Shopify
+  const creds = await getShopifyCredentials();
+  if(!creds.shopUrl || !creds.accessToken) return null;
+
+  const customer = await _searchShopifyCustomerByPhone(creds.shopUrl, creds.accessToken, normalized);
+  if(!customer){
+    // مفيش عميل بالاسم ده — احفظ في الـ cache كـ "unknown"
+    if(DB_ENABLED){
+      try{
+        await pool.query(
+          `INSERT INTO customer_risk_cache (phone, total_orders, risk_percentage, cached_at, updated_at)
+           VALUES ($1, 0, 0, NOW(), NOW())
+           ON CONFLICT (phone) DO UPDATE SET cached_at=NOW(), total_orders=0, risk_percentage=0`,
+          [normalized]
+        );
+      }catch(e){}
+    }
+    return { phone: normalized, totalOrders: 0, riskPercentage: 0, notFound: true };
+  }
+
+  const orders = await _fetchShopifyCustomerOrders(creds.shopUrl, creds.accessToken, customer.id);
+  const risk = _computeCustomerRisk(customer, orders);
+
+  const result = {
+    phone: normalized,
+    customerId: String(customer.id),
+    customerName: `${customer.first_name||''} ${customer.last_name||''}`.trim() || customer.email,
+    tags: customer.tags || '',
+    ...risk,
+    cached: false,
+  };
+
+  // احفظ في الـ cache
+  if(DB_ENABLED){
+    try{
+      await pool.query(
+        `INSERT INTO customer_risk_cache
+         (phone, shopify_customer_id, customer_name, total_orders, cancelled_orders, refunded_orders,
+          successful_orders, total_spent, risk_percentage, last_order_at, first_order_at, tags, cached_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+         ON CONFLICT (phone) DO UPDATE SET
+           shopify_customer_id=$2, customer_name=$3, total_orders=$4, cancelled_orders=$5,
+           refunded_orders=$6, successful_orders=$7, total_spent=$8, risk_percentage=$9,
+           last_order_at=$10, first_order_at=$11, tags=$12, cached_at=NOW(), updated_at=NOW()`,
+        [
+          normalized, result.customerId, result.customerName,
+          result.totalOrders, result.cancelledOrders, result.refundedOrders,
+          result.successfulOrders, result.totalSpent, result.riskPercentage,
+          result.lastOrderAt, result.firstOrderAt, result.tags
+        ]
+      );
+    }catch(e){ console.warn('cache write error:', e.message); }
+  }
+
+  return result;
+}
+
 function fetchImageAsBase64(imageUrl) {
   return new Promise((resolve) => {
     if (!imageUrl || !imageUrl.startsWith('http')) return resolve(null);
@@ -3152,7 +3390,7 @@ app.post('/api/sync-checks', adminAuth, async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v105-2026-04-28-admin-role';
+const SERVER_VERSION = 'v106-2026-04-28-customer-risk';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
@@ -5052,6 +5290,132 @@ app.get('/api/courier-adjustments/approved-unsettled/:courierId', adminAuth, asy
 // 🆕 v101: SHIPPING TRANSFER REQUESTS
 
 // POST /api/shipping-transfers — مندوب يطلب تحويل طلب
+// 🆕 v106: CUSTOMER RISK ASSESSMENT ENDPOINTS
+
+// GET /api/customer-risk/:phone — جيب تقييم عميل واحد
+app.get('/api/customer-risk/:phone', adminAuth, async (req, res) => {
+  try{
+    const forceRefresh = req.query.refresh === '1';
+    const result = await _getCustomerRisk(req.params.phone, forceRefresh);
+    if(!result) return res.status(404).json({error:'لم يمكن الحصول على بيانات Shopify'});
+    res.json(result);
+  }catch(e){
+    console.error('customer-risk error:', e.message);
+    res.status(500).json({error: e.message});
+  }
+});
+
+// POST /api/customer-risk/batch — جيب تقييم لمجموعة من العملاء
+app.post('/api/customer-risk/batch', adminAuth, async (req, res) => {
+  const { phones, forceRefresh } = req.body || {};
+  if(!Array.isArray(phones)) return res.status(400).json({error:'phones must be array'});
+  // limit للحماية من abuse
+  const list = phones.slice(0, 100);
+  const results = {};
+
+  // Process بـ concurrency limit للـ Shopify rate limit (40/sec)
+  const batchSize = 5;
+  for(let i = 0; i < list.length; i += batchSize){
+    const batch = list.slice(i, i + batchSize);
+    const batchResults = await Promise.all(
+      batch.map(p => _getCustomerRisk(p, forceRefresh).catch(e => ({error: e.message, phone: p})))
+    );
+    batch.forEach((p, idx) => { results[p] = batchResults[idx]; });
+    // Delay بين الـ batches
+    if(i + batchSize < list.length) await new Promise(r => setTimeout(r, 200));
+  }
+
+  res.json({ results });
+});
+
+// GET /api/customers-risk-list — قايمة بكل العملاء المُقيَّمين (من الـ cache)
+app.get('/api/customers-risk-list', adminAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.json([]);
+  try{
+    const minRisk = parseFloat(req.query.minRisk) || 0;
+    const minOrders = parseInt(req.query.minOrders) || 0;
+    const limit = Math.min(parseInt(req.query.limit) || 200, 500);
+
+    const r = await pool.query(
+      `SELECT * FROM customer_risk_cache
+       WHERE risk_percentage >= $1 AND total_orders >= $2
+       ORDER BY risk_percentage DESC, total_orders DESC
+       LIMIT $3`,
+      [minRisk, minOrders, limit]
+    );
+    res.json(r.rows.map(c => ({
+      phone: c.phone,
+      customerId: c.shopify_customer_id,
+      customerName: c.customer_name,
+      totalOrders: c.total_orders,
+      cancelledOrders: c.cancelled_orders,
+      refundedOrders: c.refunded_orders,
+      successfulOrders: c.successful_orders,
+      totalSpent: parseFloat(c.total_spent) || 0,
+      riskPercentage: parseFloat(c.risk_percentage) || 0,
+      lastOrderAt: c.last_order_at,
+      firstOrderAt: c.first_order_at,
+      tags: c.tags,
+      notes: c.notes,
+      cachedAt: c.cached_at,
+    })));
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// PATCH /api/customer-risk/:phone/notes — إضافة ملاحظات
+app.patch('/api/customer-risk/:phone/notes', adminAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
+  try{
+    const normalized = _normalizePhone(req.params.phone);
+    await pool.query(
+      `INSERT INTO customer_risk_cache (phone, notes, cached_at, updated_at)
+       VALUES ($1, $2, NOW(), NOW())
+       ON CONFLICT (phone) DO UPDATE SET notes=$2, updated_at=NOW()`,
+      [normalized, req.body.notes || '']
+    );
+    res.json({ success: true });
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// GET /api/risk-settings — إعدادات النظام
+app.get('/api/risk-settings', adminAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.json({ threshold: 30, minOrders: 3 });
+  try{
+    const r = await pool.query(
+      `SELECT key, value FROM app_settings WHERE key IN ('risk_threshold', 'risk_min_orders')`
+    );
+    const map = {};
+    r.rows.forEach(x => map[x.key] = x.value);
+    res.json({
+      threshold: parseInt(map.risk_threshold) || 30,
+      minOrders: parseInt(map.risk_min_orders) || 3,
+    });
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// POST /api/risk-settings — حفظ الإعدادات
+app.post('/api/risk-settings', adminAuth, async (req, res) => {
+  if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
+  const { threshold, minOrders } = req.body || {};
+  try{
+    if(threshold !== undefined){
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES ('risk_threshold', $1, NOW())
+         ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()`,
+        [String(threshold)]
+      );
+    }
+    if(minOrders !== undefined){
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES ('risk_min_orders', $1, NOW())
+         ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()`,
+        [String(minOrders)]
+      );
+    }
+    res.json({ success: true });
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
 app.post('/api/shipping-transfers', courierAuth, async (req, res) => {
   if(!DB_ENABLED) return res.status(503).json({error:'DB unavailable'});
   const { orderId, targetType, targetCourierId, reason } = req.body || {};
