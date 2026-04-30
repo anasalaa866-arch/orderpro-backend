@@ -395,6 +395,19 @@ async function initDB() {
        SET is_bosta=false, updated_at=NOW()
        WHERE is_bosta=true 
          AND courier_id IS NOT NULL`,
+      
+      // 🆕 v110: backfill - إصلاح الشحن للطلبات المستعجلة المُعيَّنة لمناديب
+      // لو الطلب express والمندوب عنده ship_express أعلى من الـ ship الحالي، نحدثه
+      `UPDATE orders o
+       SET ship = c.ship_express, updated_at=NOW()
+       FROM couriers c
+       WHERE o.courier_id = c.id
+         AND o.delivery_type = 'express'
+         AND o.status IN ('جديد', 'جاري التوصيل', 'تحت التسوية')
+         AND c.ship_express IS NOT NULL
+         AND c.ship_express > 0
+         AND o.ship < c.ship_express
+         AND (o.settled_at IS NULL)`,
       // v74: إصلاح طلبات المحل اللي اتوزعت بدون delivery_type='pickup'
       // كل الطلبات اللي عندها courier_id يساوي SHOP_COURIER_ID لازم delivery_type='pickup'
       // ده backfill لمرة واحدة (سيشتغل بدون أي ضرر لو الطلبات صح بالفعل)
@@ -1209,6 +1222,26 @@ app.patch('/api/orders/:id', adminAuth, async (req, res) => {
     sets.push(`is_bosta=$${vals.length+1}`);
     vals.push(false);
     console.log(`🔧 v110 auto-fix: clearing is_bosta=true for order ${req.params.id} (assigned to courier ${courierIdNum})`);
+  }
+  
+  // 🆕 v110: auto-fix الشحن للطلبات المستعجلة
+  // لو الطلب delivery_type='express' والـ frontend ما بعتش ship صراحةً
+  // نحدث الـ ship لـ ship_express بتاع المندوب
+  if (courierIdNum && b.ship === undefined) {
+    const deliveryType = b.deliveryType || oldRow.delivery_type;
+    if (deliveryType === 'express') {
+      try {
+        const cR = await pool.query('SELECT ship_express FROM couriers WHERE id=$1', [courierIdNum]);
+        if (cR.rows.length && cR.rows[0].ship_express) {
+          const expressShip = parseFloat(cR.rows[0].ship_express);
+          if (expressShip > 0 && parseFloat(oldRow.ship || 0) !== expressShip) {
+            sets.push(`ship=$${vals.length+1}`);
+            vals.push(expressShip);
+            console.log(`🔧 v110 auto-fix: setting ship=${expressShip} for express order ${req.params.id} (courier ${courierIdNum})`);
+          }
+        }
+      } catch(e){ console.warn('express ship lookup failed:', e.message); }
+    }
   }
   
   if (!sets.length) return res.status(400).json({ error: 'No fields to update' });
@@ -3518,7 +3551,7 @@ app.post('/api/sync-checks', adminAuth, async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v110-2026-04-30-bosta-flag-fix';
+const SERVER_VERSION = 'v110-2026-04-30-bosta-flag-and-express-ship-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
