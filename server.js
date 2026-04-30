@@ -408,6 +408,19 @@ async function initDB() {
          AND c.ship_express > 0
          AND o.ship < c.ship_express
          AND (o.settled_at IS NULL)`,
+      
+      // 🆕 v110: backfill - إصلاح الشحن للطلبات اللي عند مندوب/محل شحنه = 0
+      // (مثلاً المحل: العميل بيستلم بنفسه فمفيش شحن)
+      // ده بيصلح الطلبات اللي اتسجلت بـ ship=50 لكن المندوب فعلاً شحنه 0
+      `UPDATE orders o
+       SET ship = c.ship, updated_at=NOW()
+       FROM couriers c
+       WHERE o.courier_id = c.id
+         AND o.delivery_type IN ('normal', 'pickup', 'transit')
+         AND o.status IN ('جديد', 'جاري التوصيل', 'تحت التسوية')
+         AND c.ship IS NOT NULL
+         AND o.ship != c.ship
+         AND (o.settled_at IS NULL)`,
       // v74: إصلاح طلبات المحل اللي اتوزعت بدون delivery_type='pickup'
       // كل الطلبات اللي عندها courier_id يساوي SHOP_COURIER_ID لازم delivery_type='pickup'
       // ده backfill لمرة واحدة (سيشتغل بدون أي ضرر لو الطلبات صح بالفعل)
