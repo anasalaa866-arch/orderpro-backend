@@ -388,6 +388,13 @@ async function initDB() {
       "ALTER TABLE pending_reviews ALTER COLUMN reviewed_by TYPE TEXT USING reviewed_by::TEXT",
       // v72: نفس الإصلاح لـ courier_adjustments
       "ALTER TABLE courier_adjustments ALTER COLUMN reviewed_by TYPE TEXT USING reviewed_by::TEXT",
+      // 🆕 v110: backfill - إصلاح الطلبات اللي عندها is_bosta=true ALSO courier_id رقم
+      // ده تناقض حصل في v106- لما الـ PATCH ما كانش بيعمل is_bosta=false عند assign لمندوب
+      // الطلب الواقعي مع المندوب، فلازم is_bosta=false
+      `UPDATE orders 
+       SET is_bosta=false, updated_at=NOW()
+       WHERE is_bosta=true 
+         AND courier_id IS NOT NULL`,
       // v74: إصلاح طلبات المحل اللي اتوزعت بدون delivery_type='pickup'
       // كل الطلبات اللي عندها courier_id يساوي SHOP_COURIER_ID لازم delivery_type='pickup'
       // ده backfill لمرة واحدة (سيشتغل بدون أي ضرر لو الطلبات صح بالفعل)
@@ -1191,6 +1198,19 @@ app.patch('/api/orders/:id', adminAuth, async (req, res) => {
       }
     }
   });
+  
+  // 🆕 v110: لو في assign لمندوب حقيقي (courierId رقم صحيح) و الـ frontend ما بعتش isBosta
+  // نـ set is_bosta=false تلقائياً عشان نمنع التناقض (طلب عنده courier_id ALSO is_bosta=true)
+  // ده حصل في v106-: طلبات اتحولت من بوسطة لمندوب لكن flag is_bosta=true ضل
+  const courierIdNum = b.courierId != null && b.courierId !== 'bosta' && !isNaN(parseInt(b.courierId)) 
+    ? parseInt(b.courierId) 
+    : null;
+  if (courierIdNum && b.isBosta === undefined && oldRow.is_bosta === true) {
+    sets.push(`is_bosta=$${vals.length+1}`);
+    vals.push(false);
+    console.log(`🔧 v110 auto-fix: clearing is_bosta=true for order ${req.params.id} (assigned to courier ${courierIdNum})`);
+  }
+  
   if (!sets.length) return res.status(400).json({ error: 'No fields to update' });
   sets.push(`updated_at=NOW()`);
   vals.push(req.params.id);
@@ -3498,7 +3518,7 @@ app.post('/api/sync-checks', adminAuth, async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v109-2026-04-29-orders-limit-fix';
+const SERVER_VERSION = 'v110-2026-04-30-bosta-flag-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
