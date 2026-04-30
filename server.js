@@ -1468,9 +1468,13 @@ app.get('/api/couriers', adminAuth, async (req, res) => {
 
 app.post('/api/couriers', adminAuth, async (req, res) => {
   const c = req.body;
+  // 🆕 v110: helpers للسماح بـ 0 كقيمة صحيحة (المحل مفيش شحن)
+  const shipVal = (c.ship != null && c.ship !== '') ? parseFloat(c.ship) : 50;
+  const shipExpVal = (c.shipExpress != null && c.shipExpress !== '') ? parseFloat(c.shipExpress) : 80;
+  
   if (!DB_ENABLED) {
     const id = memCouriers.length ? Math.max(...memCouriers.map(x=>x.id))+1 : 1;
-    const nc = {id, name:c.name, phone:c.phone, zone:c.zone||'غير محدد', vehicle:c.vehicle||'دراجة بخارية', ship:c.ship||50, shipExpress:c.shipExpress||80, status:c.status||'متاح', settled:false};
+    const nc = {id, name:c.name, phone:c.phone, zone:c.zone||'غير محدد', vehicle:c.vehicle||'دراجة بخارية', ship:shipVal, shipExpress:shipExpVal, status:c.status||'متاح', settled:false};
     memCouriers.push(nc);
     return res.json({ courier: nc });
   }
@@ -1478,7 +1482,7 @@ app.post('/api/couriers', adminAuth, async (req, res) => {
     INSERT INTO couriers (name,phone,zone,vehicle,ship,ship_express,status)
     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
   `, [c.name, c.phone, c.zone||'غير محدد', c.vehicle||'دراجة بخارية',
-      c.ship||50, c.shipExpress||80, c.status||'متاح']);
+      shipVal, shipExpVal, c.status||'متاح']);
   res.json({ courier: rows[0] });
 });
 
@@ -3551,7 +3555,7 @@ app.post('/api/sync-checks', adminAuth, async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v110-2026-04-30-bosta-flag-and-express-ship-fix';
+const SERVER_VERSION = 'v110-2026-04-30-multi-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
