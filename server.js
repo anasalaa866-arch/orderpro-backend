@@ -421,6 +421,29 @@ async function initDB() {
          AND c.ship IS NOT NULL
          AND o.ship != c.ship
          AND (o.settled_at IS NULL)`,
+      
+      // 🆕 v111: backfill - تصفير شحن طلبات المحل (SHOP_COURIER_ID)
+      // المحل ملوش شحن - أي طلب عنده courier_id يساوي المحل لازم ship=0
+      `DO $$
+       DECLARE shop_id INTEGER;
+       DECLARE shop_id_text TEXT;
+       BEGIN
+         SELECT value INTO shop_id_text FROM app_settings WHERE key='shop_courier_id';
+         IF shop_id_text IS NOT NULL AND shop_id_text ~ '^[0-9]+$' THEN
+           shop_id := shop_id_text::INTEGER;
+           -- صفّر شحن المحل في جدول couriers
+           UPDATE couriers SET ship=0, ship_express=0 WHERE id=shop_id;
+           -- صفّر شحن أي طلب غير مسوّى عند المحل
+           UPDATE orders 
+           SET ship=0, updated_at=NOW()
+           WHERE courier_id = shop_id
+             AND ship != 0
+             AND status IN ('جديد', 'جاري التوصيل', 'تحت التسوية')
+             AND settled_at IS NULL;
+         END IF;
+       EXCEPTION WHEN OTHERS THEN
+         NULL;
+       END $$`,
       // v74: إصلاح طلبات المحل اللي اتوزعت بدون delivery_type='pickup'
       // كل الطلبات اللي عندها courier_id يساوي SHOP_COURIER_ID لازم delivery_type='pickup'
       // ده backfill لمرة واحدة (سيشتغل بدون أي ضرر لو الطلبات صح بالفعل)
@@ -1255,6 +1278,32 @@ app.patch('/api/orders/:id', adminAuth, async (req, res) => {
         }
       } catch(e){ console.warn('express ship lookup failed:', e.message); }
     }
+  }
+  
+  // 🆕 v111: auto-fix - لو الطلب اتسجل عند المحل (SHOP_COURIER_ID)، الشحن دايماً 0
+  // المحل ملوش شحن مهما كان الـ delivery_type
+  if (courierIdNum) {
+    try {
+      const sR = await pool.query(`SELECT value FROM app_settings WHERE key='shop_courier_id'`);
+      const shopId = sR.rows[0] && parseInt(sR.rows[0].value);
+      if (shopId && shopId === courierIdNum) {
+        // الـ frontend بعت ship مع قيمة، نحدّدها 0
+        // أو ما بعتش ship والقيمة الحالية مش 0
+        const currentShip = parseFloat(oldRow.ship || 0);
+        const sentShip = b.ship !== undefined ? parseFloat(b.ship) : null;
+        if (currentShip !== 0 || (sentShip !== null && sentShip !== 0)) {
+          // شيل أي ship موجود في sets (لو الـ frontend بعت قيمة غير 0)
+          const shipIdx = sets.findIndex(s => s.startsWith('ship='));
+          if (shipIdx >= 0) {
+            sets.splice(shipIdx, 1);
+            // ما نقدرش نشيل من vals بسهولة، فنعتمد على إن الـ index الجاي هيكتب فوقه
+          }
+          sets.push(`ship=$${vals.length+1}`);
+          vals.push(0);
+          console.log(`🔧 v111 auto-fix: setting ship=0 for shop order ${req.params.id} (shop courier)`);
+        }
+      }
+    } catch(e){ console.warn('shop ship check failed:', e.message); }
   }
   
   if (!sets.length) return res.status(400).json({ error: 'No fields to update' });
@@ -3568,7 +3617,7 @@ app.post('/api/sync-checks', adminAuth, async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v110-2026-04-30-multi-fix';
+const SERVER_VERSION = 'v111-2026-04-30-shop-free-ship';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
