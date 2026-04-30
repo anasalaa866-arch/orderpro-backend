@@ -943,7 +943,8 @@ app.get('/api/orders', adminAuth, async (req, res) => {
     // ⚠️ مهم: نشيل الـ columns الضخمة من الـ list response (مش بيتاجها الـ frontend للـ table)
     // - bosta_awb_base64 (100KB+ لكل طلب) — تتجاب من /api/orders/:id/awb
     // - line_items_json (50KB+ مع base64 صور) — تتجاب وقت الفاتورة فقط
-    const { rows } = await pool.query(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 5000`);
+    // 🆕 v109: رفع LIMIT من 5000 لـ 10000 لتجنب فقدان طلبات
+    const { rows } = await pool.query(`SELECT * FROM orders ORDER BY created_at DESC LIMIT 10000`);
     rows.forEach(r => {
       delete r.bosta_awb_base64;
       delete r.line_items_json; // ⭐ فرق كبير في الأداء
@@ -958,6 +959,98 @@ app.get('/api/orders', adminAuth, async (req, res) => {
     res.json({ orders: rows.map(rowToOrder), total: rows.length });
   } catch (e) {
     console.error('GET /api/orders error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 🆕 v109: GET /api/orders/:id/debug — معلومات تشخيصية عن طلب معين
+// بيرجع الطلب من الـ DB مباشرة + معلومات إضافية للتشخيص
+app.get('/api/orders/:id/debug', adminAuth, async (req, res) => {
+  if (!DB_ENABLED) return res.status(503).json({ error: 'DB unavailable' });
+  try {
+    const id = req.params.id;
+    
+    // جرّب البحث بـ id كامل + بدون SH- prefix
+    const variants = [id, id.replace(/^SH-/i, ''), 'SH-' + id.replace(/^SH-/i, '')];
+    let foundRow = null;
+    let foundBy = null;
+    
+    for(const v of variants){
+      const r = await pool.query('SELECT * FROM orders WHERE id=$1', [v]);
+      if(r.rows.length){
+        foundRow = r.rows[0];
+        foundBy = v;
+        break;
+      }
+    }
+    
+    if(!foundRow){
+      // ابحث بـ shopify_id كمان
+      const idNum = id.replace(/^SH-/i, '');
+      const r2 = await pool.query('SELECT * FROM orders WHERE shopify_id::text = $1 OR shopify_id::text LIKE $2', [idNum, '%' + idNum]);
+      if(r2.rows.length){
+        foundRow = r2.rows[0];
+        foundBy = 'shopify_id=' + idNum;
+      }
+    }
+    
+    if(!foundRow){
+      return res.status(404).json({ 
+        error: 'Order not found in DB',
+        searchedFor: variants,
+        suggestion: 'الطلب مش موجود في DB أصلاً - مش متجاب من Shopify'
+      });
+    }
+    
+    // شيل الحقول الضخمة
+    delete foundRow.bosta_awb_base64;
+    
+    // التحقق من شروط ظهور الطلب في /api/orders
+    const wouldShowInOrderPro = await pool.query(
+      `SELECT COUNT(*) as cnt FROM (
+        SELECT id FROM orders ORDER BY created_at DESC LIMIT 10000
+      ) sub WHERE sub.id = $1`,
+      [foundRow.id]
+    );
+    
+    const isInOrderProList = parseInt(wouldShowInOrderPro.rows[0].cnt) > 0;
+    
+    // عدد الطلبات الإجمالي
+    const totalR = await pool.query('SELECT COUNT(*) as total FROM orders');
+    const totalOrders = parseInt(totalR.rows[0].total);
+    
+    res.json({
+      found: true,
+      foundBy,
+      isInOrderProList, // هل بيظهر في /api/orders؟
+      totalOrdersInDB: totalOrders,
+      order: {
+        id: foundRow.id,
+        shopify_id: foundRow.shopify_id,
+        src: foundRow.src,
+        name: foundRow.name,
+        phone: foundRow.phone,
+        status: foundRow.status,
+        courier_id: foundRow.courier_id,
+        is_bosta: foundRow.is_bosta,
+        merged_into: foundRow.merged_into,
+        cancelled_by_field: foundRow.cancelled_by_field,
+        created_at: foundRow.created_at,
+        updated_at: foundRow.updated_at,
+        total: foundRow.total,
+      },
+      diagnostics: {
+        isInLatestLimit: isInOrderProList,
+        isMerged: !!foundRow.merged_into,
+        isCancelledByField: !!foundRow.cancelled_by_field,
+        hasOldDate: foundRow.created_at && (Date.now() - new Date(foundRow.created_at).getTime() > 90 * 24 * 60 * 60 * 1000),
+        explanation: isInOrderProList 
+          ? '✅ الطلب لازم يظهر في OrderPro - لو مش ظاهر، المشكلة في الـ frontend (cache/filter)'
+          : '⚠️ الطلب موجود في DB بس مش ضمن آخر 10000 طلب - LIMIT problem'
+      }
+    });
+  } catch (e) {
+    console.error('GET /api/orders/:id/debug error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -3405,7 +3498,7 @@ app.post('/api/sync-checks', adminAuth, async (req, res) => {
 });
 
 // ===== HEALTH =====
-const SERVER_VERSION = 'v108-2026-04-29-partial-delivery-and-proof-fix';
+const SERVER_VERSION = 'v109-2026-04-29-orders-limit-fix';
 app.get('/', async (req, res) => {
   let dbOk = false, orderCount = 0, hasPreparation = false, shopCourierId = null;
   if (DB_ENABLED) {
